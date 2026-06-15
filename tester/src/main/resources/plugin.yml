@@ -1,0 +1,7 @@
+name: AsyncTNTTester
+version: '${version}'
+main: me.vexmc.asynctnt.tester.AsyncTntTesterPlugin
+api-version: '1.17'
+folia-supported: true
+depend: [AsyncTNT]
+description: In-server integration harness and vanilla-parity oracle for AsyncTNT.

@@ -1,0 +1,18 @@
+name: AsyncTNT
+version: '${version}'
+main: me.vexmc.asynctnt.AsyncTntPlugin
+api-version: '1.17'
+folia-supported: true
+authors: [owengregson]
+description: Folia-native asynchronous TNT and falling-block ticking with 1:1 vanilla physics.
+commands:
+  asynctnt:
+    aliases: [atnt]
+    permission: asynctnt.command.use
+permissions:
+  asynctnt.*:
+    default: op
+    children:
+      asynctnt.command.use: true
+  asynctnt.command.use:
+    default: op
