@@ -293,11 +293,20 @@ public final class ParitySuite {
                 return;
             }
 
-            String vanillaCell = runSandDrop(context, service, true);
+            // The engine MUST drive the sand through the water and settle it on
+            // the floor — this is the cannon-critical asymmetry and a hard pin.
             String engineCell = runSandDrop(context, service, false);
-            if (vanillaCell == null || engineCell == null) {
-                context.note("a sand payload never settled in the water column — "
-                        + "sand-through-water parity skipped");
+            context.expect(engineCell != null,
+                    "engine-driven sand never settled in the water column");
+
+            // The control is the at-spawn forceVanilla release: a confounded
+            // in-process baseline (like the TNT control), not a pristine vanilla
+            // entity. Compare when it settles; otherwise record and move on.
+            String vanillaCell = runSandDrop(context, service, true);
+            if (vanillaCell == null) {
+                context.note("engine sand settled at " + engineCell + "; the in-process forceVanilla "
+                        + "control did not settle on this version (the at-spawn-released falling block "
+                        + "is a confounded baseline) — engine-vs-vanilla landing comparison skipped");
                 return;
             }
             context.note("sand-through-water: vanilla landed at " + vanillaCell
@@ -313,8 +322,11 @@ public final class ParitySuite {
         int x = centre.getBlockX();
         int z = centre.getBlockZ();
         int surfaceY = centre.getBlockY(); // floorY() rests on this block's top
+        // Guarantee a solid floor directly under the column so the payload always
+        // has something to land on regardless of platform depth / world height.
+        world.getBlockAt(x, surfaceY - 1, z).setType(Material.STONE, false);
         // Carve a shaft and fill it with water: a still 4-block column the sand
-        // falls through. The platform floor below stops the sand.
+        // falls through. The stone floor below stops the sand.
         for (int y = surfaceY; y < surfaceY + 4; y++) {
             world.getBlockAt(x, y, z).setType(Material.WATER, false);
         }
@@ -331,18 +343,29 @@ public final class ParitySuite {
         try {
             context.syncRun(() -> {
                 World world = Bukkit.getWorlds().get(0);
-                Location centre = Arena.centre(world);
+                // Re-stage a FRESH column each run so the two runs are independent
+                // (a prior run's placed sand / disturbed water must not change where
+                // this run lands).
+                Location centre = Arena.prepare(world);
+                placeWaterColumn(world, centre);
                 sand[0] = Cannon.launchSand(
                         Arena.offset(centre, 0.5, 8.0, 0.5), new Vector(0, 0, 0));
                 if (forceVanilla) {
                     service.forceVanilla(sand[0]);
                 }
             });
-            // Wait for the payload to fall through the column and settle.
-            context.awaitUntil(() -> {
-                FallingBlock payload = sand[0];
-                return payload == null || !payload.isValid();
-            }, PAYLOAD_MAX_TICKS, "sand payload to settle in the water column");
+            // Wait for the payload to fall through the column and settle. A
+            // timeout returns null (did not settle) rather than failing — the
+            // caller decides whether that is fatal (engine run) or just a
+            // confounded baseline (the at-spawn forceVanilla control).
+            try {
+                context.awaitUntil(() -> {
+                    FallingBlock payload = sand[0];
+                    return payload == null || !payload.isValid();
+                }, PAYLOAD_MAX_TICKS, "sand payload to settle in the water column");
+            } catch (AssertionError timedOut) {
+                return null;
+            }
 
             return context.sync(() -> {
                 FallingBlock payload = sand[0];

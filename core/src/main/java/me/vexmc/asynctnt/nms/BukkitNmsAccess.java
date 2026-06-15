@@ -1,11 +1,13 @@
 package me.vexmc.asynctnt.nms;
 
+import java.lang.reflect.Constructor;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 
+import org.bukkit.Bukkit;
 import org.bukkit.FluidCollisionMode;
 import org.bukkit.Location;
 import org.bukkit.Material;
@@ -13,22 +15,25 @@ import org.bukkit.Particle;
 import org.bukkit.Sound;
 import org.bukkit.World;
 import org.bukkit.block.Block;
-import org.bukkit.block.data.Levelled;
+import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.FallingBlock;
 import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.TNTPrimed;
+import org.bukkit.event.entity.EntityExplodeEvent;
+import org.bukkit.event.entity.ExplosionPrimeEvent;
+import org.bukkit.inventory.ItemStack;
 import org.bukkit.util.BoundingBox;
 import org.bukkit.util.RayTraceResult;
 import org.bukkit.util.Vector;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
-import me.vexmc.asynctnt.common.engine.EntityPush;
-import me.vexmc.asynctnt.common.engine.ExplosionResult;
 import me.vexmc.asynctnt.common.math.Aabb;
 import me.vexmc.asynctnt.common.math.BlockPos;
 import me.vexmc.asynctnt.common.math.Mth;
 import me.vexmc.asynctnt.common.math.Vec3d;
+import me.vexmc.asynctnt.common.rng.SeededRng;
 import me.vexmc.asynctnt.common.snapshot.BlastResistanceView;
 import me.vexmc.asynctnt.common.snapshot.BlockCollisionView;
 import me.vexmc.asynctnt.common.snapshot.BodyState;
@@ -36,22 +41,24 @@ import me.vexmc.asynctnt.common.snapshot.EntitySnapshot;
 import me.vexmc.asynctnt.common.snapshot.FluidView;
 
 /**
- * Bukkit-API-based {@link NmsAccess}. Everything achievable through the public
- * API is done here directly (body read/write, collision boxes, entity gather +
- * exact {@code getSeenPercent} via {@code rayTraceBlocks}, block destruction,
- * knockback, effects); the few values the API does not expose — explosion
- * resistance and fluid flow — use a vanilla-constant table and a flow
- * approximation, which are the documented matrix-verified refinement points.
- * Effect enums are looked up defensively so a per-version rename never crashes.
- *
- * <p>All methods run on the owning region thread. The takeover neutralizes the
- * vanilla tick via {@code setGravity(false)} + zeroed vanilla velocity + a held
- * fuse, so {@code PrimedTnt.tick} becomes a no-op regardless of tick ordering.
+ * Bukkit-API-based {@link NmsAccess}. Body read/write, collision boxes, entity
+ * gather with an exact {@code getSeenPercent} rayTrace port, the vanilla
+ * explosion events (so protection plugins work like vanilla), block destruction
+ * + drops, knockback, and effects are all done through the public API. The two
+ * values the API does not expose — explosion resistance and fluid flow — use a
+ * vanilla-constant table and a flow approximation here; {@link NmsReflection}
+ * upgrades them to the exact NMS values when available. Effect/event lookups are
+ * defensive so a per-version rename never crashes.
  */
 public final class BukkitNmsAccess implements NmsAccess {
 
-    /** Held vanilla fuse keeps it well above 0 so the server never self-detonates. */
     private static final int HELD_FUSE_FLOOR = 4;
+
+    private final NmsReflection reflection;
+
+    public BukkitNmsAccess(org.bukkit.plugin.java.JavaPlugin plugin) {
+        this.reflection = new NmsReflection(plugin);
+    }
 
     @Override
     public boolean available() {
@@ -143,8 +150,15 @@ public final class BukkitNmsAccess implements NmsAccess {
                         if (b.getType() != Material.WATER) {
                             continue;
                         }
-                        float height = waterHeight(b);
-                        cells.add(new FluidView.FluidCell(y, height, approximateFlow(world, x, y, z)));
+                        Vec3d flow = reflection.fluidFlow(b);
+                        float height = reflection.fluidHeight(b);
+                        if (flow == null) {
+                            flow = approximateFlow(world, x, y, z);
+                        }
+                        if (Float.isNaN(height)) {
+                            height = waterHeight(b);
+                        }
+                        cells.add(new FluidView.FluidCell(y, height, flow));
                     }
                 }
             }
@@ -153,8 +167,7 @@ public final class BukkitNmsAccess implements NmsAccess {
     }
 
     private static float waterHeight(Block b) {
-        // Source (level 0) ~ 8/9; flowing levels 1..7 lower. Approximates FluidState.getOwnHeight.
-        if (b.getBlockData() instanceof Levelled lev) {
+        if (b.getBlockData() instanceof org.bukkit.block.data.Levelled lev) {
             int level = lev.getLevel();
             if (level == 0) {
                 return 0.8888889f;
@@ -165,7 +178,6 @@ public final class BukkitNmsAccess implements NmsAccess {
         return 0.8888889f;
     }
 
-    /** Approximate FluidState.getFlow: points toward lower-water / open neighbours. */
     private static Vec3d approximateFlow(World world, int x, int y, int z) {
         double fx = 0, fz = 0;
         float here = waterHeight(world.getBlockAt(x, y, z));
@@ -178,7 +190,7 @@ public final class BukkitNmsAccess implements NmsAccess {
             } else if (n.isPassable() || n.isEmpty()) {
                 there = 0.0f;
             } else {
-                continue; // solid neighbour: no flow that way
+                continue;
             }
             double diff = here - there;
             if (diff > 0) {
@@ -192,28 +204,33 @@ public final class BukkitNmsAccess implements NmsAccess {
     @Override
     public @NotNull BlastResistanceView captureBlast(@NotNull World world, @NotNull Vec3d center, int radius) {
         int cx = Mth.floor(center.x()), cy = Mth.floor(center.y()), cz = Mth.floor(center.z());
-        int min = -radius, max = radius;
-        int side = max - min + 1;
+        int side = 2 * radius + 1;
         int minWorldY = world.getMinHeight();
         int maxWorldY = world.getMaxHeight();
         float[] resistance = new float[side * side * side];
         boolean[] air = new boolean[side * side * side];
         boolean[] destroyable = new boolean[side * side * side];
         boolean[] outside = new boolean[side * side * side];
-        for (int dx = min; dx <= max; dx++) {
-            for (int dy = min; dy <= max; dy++) {
-                for (int dz = min; dz <= max; dz++) {
-                    int i = index(dx - min, dy - min, dz - min, side);
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -radius; dy <= radius; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    int i = ((dx + radius) * side + (dy + radius)) * side + (dz + radius);
                     int wy = cy + dy;
                     if (wy < minWorldY || wy >= maxWorldY) {
                         outside[i] = true;
                         resistance[i] = Float.NaN;
                         continue;
                     }
-                    Material m = world.getBlockAt(cx + dx, wy, cz + dz).getType();
+                    Block block = world.getBlockAt(cx + dx, wy, cz + dz);
+                    Material m = block.getType();
                     boolean isAir = m.isAir();
                     air[i] = isAir;
-                    resistance[i] = isAir ? Float.NaN : blastResistance(m);
+                    if (isAir) {
+                        resistance[i] = Float.NaN;
+                    } else {
+                        float exact = reflection.explosionResistance(block);
+                        resistance[i] = Float.isNaN(exact) ? blastResistance(m) : exact;
+                    }
                     destroyable[i] = !isAir && isDestroyable(m);
                 }
             }
@@ -221,11 +238,6 @@ public final class BukkitNmsAccess implements NmsAccess {
         return new CubeBlastView(cx, cy, cz, radius, side, resistance, air, destroyable, outside);
     }
 
-    private static int index(int x, int y, int z, int side) {
-        return (x * side + y) * side + z;
-    }
-
-    /** Immutable blast-cube snapshot — safe to read off-thread. */
     private record CubeBlastView(int cx, int cy, int cz, int radius, int side,
                                  float[] resistance, boolean[] air, boolean[] destroyable, boolean[] outside)
             implements BlastResistanceView {
@@ -246,7 +258,7 @@ public final class BukkitNmsAccess implements NmsAccess {
         @Override
         public boolean outOfWorld(int x, int y, int z) {
             int i = idx(x, y, z);
-            return i < 0 || outside[i]; // leaving the captured cube terminates the ray
+            return i < 0 || outside[i];
         }
 
         @Override
@@ -268,12 +280,12 @@ public final class BukkitNmsAccess implements NmsAccess {
     }
 
     @Override
-    public @NotNull List<EntitySnapshot> captureEntities(@NotNull World world, @NotNull Vec3d center,
-                                                         double diameter, long ignoredEntityId) {
+    public @NotNull List<ExplosionTarget> captureExplosionTargets(@NotNull World world, @NotNull Vec3d center,
+                                                                  double diameter, long ignoredEntityId) {
         Location c = new Location(world, center.x(), center.y(), center.z());
         double reach = diameter + 1.0;
         Collection<Entity> near = world.getNearbyEntities(c, reach, reach, reach);
-        List<EntitySnapshot> out = new ArrayList<>();
+        List<ExplosionTarget> out = new ArrayList<>();
         for (Entity e : near) {
             if (e.getEntityId() == ignoredEntityId || !e.isValid()) {
                 continue;
@@ -289,14 +301,14 @@ public final class BukkitNmsAccess implements NmsAccess {
             }
             BoundingBox bb = e.getBoundingBox();
             Aabb box = new Aabb(bb.getMinX(), bb.getMinY(), bb.getMinZ(), bb.getMaxX(), bb.getMaxY(), bb.getMaxZ());
-            double kbResist = 0.0; // refined per-version via the knockback-resistance attribute in the matrix
+            double kbResist = living ? reflection.explosionKnockbackResistance((LivingEntity) e) : 0.0;
             double seen = seenPercent(world, center, bb);
-            out.add(new EntitySnapshot(e.getEntityId(), tnt, living, feet, eye, box, kbResist, seen, false));
+            EntitySnapshot snap = new EntitySnapshot(e.getEntityId(), tnt, living, feet, eye, box, kbResist, seen, false);
+            out.add(new ExplosionTarget(e, snap));
         }
         return out;
     }
 
-    /** Exact vanilla getSeenPercent grid, using rayTraceBlocks for the COLLIDER clip. */
     private static double seenPercent(World world, Vec3d center, BoundingBox bb) {
         double dx = 1.0 / ((bb.getMaxX() - bb.getMinX()) * 2.0 + 1.0);
         double dy = 1.0 / ((bb.getMaxY() - bb.getMinY()) * 2.0 + 1.0);
@@ -314,13 +326,11 @@ public final class BukkitNmsAccess implements NmsAccess {
                     double sx = Mth.lerp(a, bb.getMinX(), bb.getMaxX()) + ox;
                     double sy = Mth.lerp(b, bb.getMinY(), bb.getMaxY());
                     double sz = Mth.lerp(cc, bb.getMinZ(), bb.getMaxZ()) + oz;
-                    Vector start = new Vector(sx, sy, sz);
-                    Vector dir = centerVec.clone().subtract(start);
+                    Vector dir = centerVec.clone().subtract(new Vector(sx, sy, sz));
                     double dist = dir.length();
                     if (dist > 1.0E-7) {
                         RayTraceResult hit = world.rayTraceBlocks(
-                                new Location(world, sx, sy, sz), dir, dist,
-                                FluidCollisionMode.NEVER, true);
+                                new Location(world, sx, sy, sz), dir, dist, FluidCollisionMode.NEVER, true);
                         if (hit == null) {
                             hits++;
                         }
@@ -350,30 +360,127 @@ public final class BukkitNmsAccess implements NmsAccess {
         } catch (UnsupportedOperationException folia) {
             entity.teleportAsync(target);
         }
-        entity.setVelocity(new Vector(0, 0, 0)); // keep the vanilla tick a no-op
+        entity.setVelocity(new Vector(0, 0, 0));
         if (entity instanceof TNTPrimed tnt) {
             tnt.setFuseTicks(Math.max(HELD_FUSE_FLOOR, state.fuseOrTime()));
         }
     }
 
     @Override
-    public void destroyBlocks(@NotNull World world, @NotNull ExplosionResult result) {
-        for (BlockPos pos : result.broken()) {
-            Block b = world.getBlockAt(pos.x(), pos.y(), pos.z());
-            if (!b.getType().isAir()) {
-                b.setType(Material.AIR, true); // applyPhysics=true so water/redstone react like vanilla
+    public void applyPush(@NotNull Entity victim, @NotNull Vec3d knockback, float damage) {
+        if (!victim.isValid()) {
+            return;
+        }
+        if (victim instanceof LivingEntity le && damage > 0.0f) {
+            try {
+                le.damage(damage);
+            } catch (Throwable ignored) {
+                // some entities reject generic damage; knockback still applies
             }
+        }
+        victim.setVelocity(victim.getVelocity().add(new Vector(knockback.x(), knockback.y(), knockback.z())));
+    }
+
+    @Override
+    public @NotNull PrimeResult fireExplosionPrime(@NotNull Entity tnt) {
+        ExplosionPrimeEvent event = new ExplosionPrimeEvent(tnt, 4.0f, false);
+        Bukkit.getPluginManager().callEvent(event);
+        return new PrimeResult(event.isCancelled(), event.getRadius(), event.getFire());
+    }
+
+    @Override
+    public @NotNull ExplodeResult fireEntityExplode(@NotNull Entity tnt, @NotNull Vec3d center,
+                                                    @NotNull List<BlockPos> broken, float yield) {
+        List<Block> blocks = new ArrayList<>(broken.size());
+        for (BlockPos p : broken) {
+            Block b = tnt.getWorld().getBlockAt(p.x(), p.y(), p.z());
+            if (!b.getType().isAir()) {
+                blocks.add(b);
+            }
+        }
+        Location loc = new Location(tnt.getWorld(), center.x(), center.y(), center.z());
+        EntityExplodeEvent event = newEntityExplodeEvent(tnt, loc, blocks, yield);
+        if (event == null) {
+            // Could not construct the event on this version — destroy as solved
+            // rather than silently dropping protection; logged once in NmsReflection.
+            return new ExplodeResult(false, broken, yield);
+        }
+        Bukkit.getPluginManager().callEvent(event);
+        List<BlockPos> survivors = new ArrayList<>();
+        for (Block b : event.blockList()) {
+            survivors.add(new BlockPos(b.getX(), b.getY(), b.getZ()));
+        }
+        return new ExplodeResult(event.isCancelled(), survivors, event.getYield());
+    }
+
+    // EntityExplodeEvent gained a 5-arg (…, ExplosionResult) constructor at 1.21;
+    // resolve whichever exists once and reuse it.
+    private volatile Constructor<EntityExplodeEvent> explodeCtor;
+    private volatile Object explosionResultDecay;
+    private volatile boolean explodeCtorTried;
+
+    @Nullable
+    private EntityExplodeEvent newEntityExplodeEvent(Entity tnt, Location loc, List<Block> blocks, float yield) {
+        if (!explodeCtorTried) {
+            resolveExplodeCtor();
+        }
+        Constructor<EntityExplodeEvent> ctor = explodeCtor;
+        if (ctor == null) {
+            return null;
+        }
+        try {
+            if (ctor.getParameterCount() == 5) {
+                return ctor.newInstance(tnt, loc, blocks, yield, explosionResultDecay);
+            }
+            return ctor.newInstance(tnt, loc, blocks, yield);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private synchronized void resolveExplodeCtor() {
+        if (explodeCtorTried) {
+            return;
+        }
+        explodeCtorTried = true;
+        try {
+            Class<?> resultClass = Class.forName("org.bukkit.ExplosionResult");
+            for (Object constant : resultClass.getEnumConstants()) {
+                if (((Enum<?>) constant).name().equals("DESTROY_WITH_DECAY")) {
+                    explosionResultDecay = constant;
+                    break;
+                }
+            }
+            explodeCtor = (Constructor<EntityExplodeEvent>) EntityExplodeEvent.class.getConstructor(
+                    Entity.class, Location.class, List.class, float.class, resultClass);
+            return;
+        } catch (Throwable modernAbsent) {
+            // fall through to the legacy 4-arg constructor
+        }
+        try {
+            explodeCtor = EntityExplodeEvent.class.getConstructor(
+                    Entity.class, Location.class, List.class, float.class);
+        } catch (Throwable legacyAbsent) {
+            explodeCtor = null;
         }
     }
 
     @Override
-    public void applyPush(@NotNull World world, @NotNull EntityPush push) {
-        Entity victim = resolveEntity(world, push.entityId());
-        if (victim == null) {
-            return;
+    public void destroyBlocks(@NotNull World world, @NotNull List<BlockPos> blocks, float yield, long dropSeed) {
+        SeededRng rng = new SeededRng(dropSeed);
+        boolean dropItems = world.getGameRuleValue(org.bukkit.GameRule.DO_TILE_DROPS) != Boolean.FALSE;
+        for (BlockPos pos : blocks) {
+            Block b = world.getBlockAt(pos.x(), pos.y(), pos.z());
+            if (b.getType().isAir()) {
+                continue;
+            }
+            Collection<ItemStack> drops = (dropItems && yield > 0.0f && rng.nextFloat() < yield)
+                    ? b.getDrops() : List.of();
+            b.setType(Material.AIR, true);
+            for (ItemStack drop : drops) {
+                world.dropItemNaturally(new Location(world, pos.x() + 0.5, pos.y() + 0.5, pos.z() + 0.5), drop);
+            }
         }
-        Vec3d kb = push.knockback();
-        victim.setVelocity(victim.getVelocity().add(new Vector(kb.x(), kb.y(), kb.z())));
     }
 
     @Override
@@ -382,12 +489,30 @@ public final class BukkitNmsAccess implements NmsAccess {
         try {
             world.playSound(loc, Sound.ENTITY_GENERIC_EXPLODE, 4.0f, 1.0f);
         } catch (Throwable ignored) {
-            // cosmetic; sound enum may be renamed on a version
         }
         try {
             world.spawnParticle(Particle.EXPLOSION_LARGE, loc, 1);
-        } catch (Throwable ignored) {
-            // cosmetic; particle enum may be renamed on a version
+        } catch (Throwable renamed) {
+            try {
+                world.spawnParticle(Particle.valueOf("EXPLOSION_EMITTER"), loc, 1);
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    @Override
+    public void landFallingBlock(@NotNull World world, @NotNull BodyState state, @Nullable BlockData data) {
+        if (data == null) {
+            return;
+        }
+        int bx = Mth.floor(state.x()), by = Mth.floor(state.y()), bz = Mth.floor(state.z());
+        Block block = world.getBlockAt(bx, by, bz);
+        Material at = block.getType();
+        if (at.isAir() || block.isLiquid() || !block.getType().isSolid()) {
+            block.setBlockData(data, true);
+        } else if (world.getGameRuleValue(org.bukkit.GameRule.DO_ENTITY_DROPS) != Boolean.FALSE) {
+            world.dropItemNaturally(new Location(world, bx + 0.5, by + 0.5, bz + 0.5),
+                    new ItemStack(data.getMaterial()));
         }
     }
 
@@ -396,17 +521,7 @@ public final class BukkitNmsAccess implements NmsAccess {
         entity.remove();
     }
 
-    @Override
-    public Entity resolveEntity(@NotNull World world, long entityId) {
-        for (Entity e : world.getEntities()) {
-            if (e.getEntityId() == entityId) {
-                return e;
-            }
-        }
-        return null;
-    }
-
-    // ── blast-resistance table (vanilla constants; refined via NMS in the matrix) ──
+    // ── blast-resistance fallback table (used only when NMS reflection is unavailable) ──
     private static final Map<Material, Float> RESISTANCE = new EnumMap<>(Material.class);
 
     static {
@@ -433,7 +548,7 @@ public final class BukkitNmsAccess implements NmsAccess {
 
     private static float blastResistance(Material m) {
         Float v = RESISTANCE.get(m);
-        return v != null ? v : 1.0f; // conservative default; exact NMS value verified in the matrix
+        return v != null ? v : 1.0f;
     }
 
     private static boolean isDestroyable(Material m) {

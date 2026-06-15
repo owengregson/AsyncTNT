@@ -13,24 +13,20 @@ import java.util.function.Supplier;
 
 import org.bukkit.Location;
 import org.bukkit.World;
-import org.bukkit.block.Block;
 import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.FallingBlock;
-import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.jetbrains.annotations.NotNull;
 
 import me.vexmc.asynctnt.api.event.AsyncTntTakeoverEvent;
 import me.vexmc.asynctnt.common.engine.EntityPush;
 import me.vexmc.asynctnt.common.engine.ExplosionInput;
-import me.vexmc.asynctnt.common.engine.ExplosionResult;
+import me.vexmc.asynctnt.common.engine.ExplosionSolver;
 import me.vexmc.asynctnt.common.engine.MotionIntegrator;
 import me.vexmc.asynctnt.common.engine.MotionResult;
-import me.vexmc.asynctnt.common.engine.ExplosionSolver;
 import me.vexmc.asynctnt.common.math.Aabb;
 import me.vexmc.asynctnt.common.math.BlockPos;
-import me.vexmc.asynctnt.common.math.Mth;
 import me.vexmc.asynctnt.common.math.Vec3d;
 import me.vexmc.asynctnt.common.rng.RayFloats;
 import me.vexmc.asynctnt.common.rng.SeededRng;
@@ -38,9 +34,7 @@ import me.vexmc.asynctnt.common.scheduling.Scheduling;
 import me.vexmc.asynctnt.common.snapshot.BlastResistanceView;
 import me.vexmc.asynctnt.common.snapshot.BlockCollisionView;
 import me.vexmc.asynctnt.common.snapshot.BodyState;
-import me.vexmc.asynctnt.common.snapshot.EntitySnapshot;
 import me.vexmc.asynctnt.common.snapshot.FluidView;
-import me.vexmc.asynctnt.common.version.ForkFlags;
 import me.vexmc.asynctnt.common.version.PhysicsProfile;
 import me.vexmc.asynctnt.config.AsyncTntConfig;
 import me.vexmc.asynctnt.nms.NmsAccess;
@@ -48,21 +42,18 @@ import me.vexmc.asynctnt.nms.NmsAccess;
 /**
  * The off-thread TNT/falling-block engine. On takeover it neutralizes the
  * vanilla tick and drives each body via the {@link Scheduling} seam (region-
- * correct on Folia, main-thread on Paper). Per tick it integrates movement
- * inline on the owning thread (cheap, deterministic) using live collision/fluid
- * views; on detonation it snapshots the blast cube + entities, then runs the
- * heavy 1352-ray solve on the worker pool and applies the result per owning
- * region. Any error on a body returns it to vanilla ticking — never dropped.
- *
- * <p>The explosion's per-ray RNG is seeded deterministically from the centre
- * and world time via {@link SeededRng}, so it never touches {@code level.random}
- * (the cardinal safety rule) while staying reproducible and vanilla-equivalent;
- * the cannon-relevant knockback is RNG-free and therefore exact.
+ * correct on Folia, main-thread on Paper). Movement is integrated inline on the
+ * owning thread; explosion knockback (cannon-critical, RNG-free) is also applied
+ * inline the same tick the TNT detonates, while the heavy 1352-ray block march
+ * runs on a worker pool and is applied per owning region a tick later (block-
+ * break latency is imperceptible). Vanilla's {@code ExplosionPrimeEvent} and
+ * {@code EntityExplodeEvent} are fired so protection plugins behave exactly as
+ * with vanilla. Any error on a body returns it to vanilla ticking.
  */
 public final class AsyncTntEngine implements EngineHandle {
 
-    private static final float TNT_POWER = 4.0f;
-    private static final int BLAST_RADIUS = 8; // power-4 rays reach < ~6 blocks; 8 is safe.
+    private static final int MAX_FALLING_BLOCK_AGE = 600; // vanilla autoExpire
+    private static final int OUT_OF_WORLD_GRACE = 100;     // vanilla out-of-world discard delay
 
     private final JavaPlugin plugin;
     private final Scheduling scheduling;
@@ -110,7 +101,6 @@ public final class AsyncTntEngine implements EngineHandle {
         }
     }
 
-    // ── EngineHandle ─────────────────────────────────────────────────────────
     @Override
     public boolean isActive() {
         return active && nms.available();
@@ -136,13 +126,9 @@ public final class AsyncTntEngine implements EngineHandle {
         return scheduling.describe();
     }
 
-    // ── takeover ─────────────────────────────────────────────────────────────
     /** Called on the spawn's owning thread by the spawn interceptor. */
     public void takeOver(Entity entity) {
-        if (!isActive()) {
-            return;
-        }
-        if (!config.get().enabledIn(entity.getWorld().getName())) {
+        if (!isActive() || !config.get().enabledIn(entity.getWorld().getName())) {
             return;
         }
         boolean tnt = nms.isPrimedTnt(entity);
@@ -153,7 +139,7 @@ public final class AsyncTntEngine implements EngineHandle {
             return;
         }
         BodyState state = nms.readBody(entity); // read the real fuse/velocity BEFORE neutralizing
-        ForkFlags forks = config.get().forkFlags();
+        var forks = config.get().forkFlags();
         if (tnt && forks.zeroSpawnKick()) {
             state = state.withMotion(new Vec3d(0.0, state.dy(), 0.0));
         }
@@ -168,7 +154,6 @@ public final class AsyncTntEngine implements EngineHandle {
         plugin.getServer().getPluginManager().callEvent(new AsyncTntTakeoverEvent(entity));
     }
 
-    // ── per-tick (owning thread) ─────────────────────────────────────────────
     private void tick(EngineBody body) {
         if (body.released || !active) {
             return;
@@ -180,7 +165,7 @@ public final class AsyncTntEngine implements EngineHandle {
         }
         World world = entity.getWorld();
         if (!config.get().enabledIn(world.getName())) {
-            forceVanilla(entity); // kill-switch / per-world disable: hand back to vanilla
+            forceVanilla(entity); // kill-switch / per-world disable
             return;
         }
         try {
@@ -198,6 +183,9 @@ public final class AsyncTntEngine implements EngineHandle {
                 detonate(body);
             } else if (result.landed()) {
                 land(body);
+            } else if (s.kind() == BodyState.Kind.FALLING_BLOCK && shouldDespawn(body.state, world)) {
+                // Vanilla discards falling blocks past their age / out of the world.
+                removeBodyAndEntity(body);
             }
         } catch (Throwable t) {
             plugin.getLogger().warning("AsyncTNT body errored; returning it to vanilla: " + t);
@@ -205,84 +193,109 @@ public final class AsyncTntEngine implements EngineHandle {
         }
     }
 
-    // ── detonation (snapshot here, solve off-thread, apply per region) ────────
+    private static boolean shouldDespawn(BodyState s, World world) {
+        int age = s.fuseOrTime();
+        if (age > MAX_FALLING_BLOCK_AGE) {
+            return true;
+        }
+        return age > OUT_OF_WORLD_GRACE && (s.y() < world.getMinHeight() || s.y() >= world.getMaxHeight());
+    }
+
+    // ── detonation: ExplosionPrimeEvent -> inline knockback -> offload blocks -> EntityExplodeEvent ──
     private void detonate(EngineBody body) {
-        Entity entity = body.entity;
-        World world = entity.getWorld();
-        Vec3d center = nms.explosionCenter(entity);
+        Entity tnt = body.entity;
+        World world = tnt.getWorld();
 
-        SeededRng rng = new SeededRng(seedFor(center, world));
-        float[] rays = RayFloats.draw(rng::nextFloat);
-        BlastResistanceView blast = nms.captureBlast(world, center, BLAST_RADIUS);
-        List<EntitySnapshot> entities = nms.captureEntities(world, center, TNT_POWER * 2.0, entity.getEntityId());
-        ExplosionInput input = new ExplosionInput(center, TNT_POWER, false, blast, rays, entities, profile);
+        NmsAccess.PrimeResult prime = nms.fireExplosionPrime(tnt);
+        if (prime.cancelled()) {
+            removeBodyAndEntity(body); // vanilla discards the TNT even when the prime is cancelled
+            return;
+        }
+        float power = prime.radius();
+        boolean fire = prime.fire();
+        Vec3d center = nms.explosionCenter(tnt);
 
-        removeBodyAndEntity(body); // the TNT is gone the moment it detonates
+        // Inline, same-tick knockback (cannon aim) — RNG-free, applied to live entities.
+        for (NmsAccess.ExplosionTarget target : nms.captureExplosionTargets(world, center, power * 2.0, tnt.getEntityId())) {
+            EntityPush push = ExplosionSolver.knockbackFor(center, power, target.snapshot());
+            if (push != null) {
+                nms.applyPush(target.entity(), push.knockback(), push.damage());
+            }
+        }
+
+        // Snapshot the blast cube + pre-draw the per-ray RNG (never touches level.random).
+        long seed = seedFor(center, world);
+        float[] rays = RayFloats.draw(new SeededRng(seed)::nextFloat);
+        int radius = blastRadius(power);
+        BlastResistanceView blast = nms.captureBlast(world, center, radius);
+        ExplosionInput input = new ExplosionInput(center, power, fire, blast, rays, List.of(), profile);
+
+        // Release the body (keep the entity reference for EntityExplodeEvent + removal in the apply).
+        body.released = true;
+        if (body.driver != null) {
+            body.driver.cancel();
+        }
+        bodies.remove(tnt.getUniqueId());
 
         Location at = new Location(world, center.x(), center.y(), center.z());
         ExecutorService w = this.workers;
         if (active && w != null && !w.isShutdown()) {
             w.submit(() -> {
-                ExplosionResult solved;
+                List<BlockPos> broken;
                 try {
-                    solved = ExplosionSolver.solve(input);
+                    broken = ExplosionSolver.solveBlocks(input);
                 } catch (Throwable t) {
                     plugin.getLogger().warning("AsyncTNT explosion solve failed: " + t);
+                    scheduling.runAt(at, () -> {
+                        nms.emitExplosionEffects(world, center);
+                        nms.removeEntity(tnt);
+                    });
                     return;
                 }
-                scheduling.runAt(at, () -> applyExplosion(world, center, solved));
+                scheduling.runAt(at, () -> applyExplosion(world, tnt, center, broken, power, seed));
             });
         } else {
-            applyExplosion(world, center, ExplosionSolver.solve(input));
+            applyExplosion(world, tnt, center, ExplosionSolver.solveBlocks(input), power, seed);
         }
     }
 
-    private void applyExplosion(World world, Vec3d center, ExplosionResult result) {
-        // Block destruction: bucket by chunk so each batch applies on its owning region (Folia).
-        Map<Long, List<BlockPos>> byChunk = new HashMap<>();
-        for (BlockPos pos : result.broken()) {
-            long key = (((long) (pos.x() >> 4)) << 32) | ((pos.z() >> 4) & 0xFFFFFFFFL);
-            byChunk.computeIfAbsent(key, k -> new ArrayList<>()).add(pos);
-        }
-        for (List<BlockPos> bucket : byChunk.values()) {
-            BlockPos any = bucket.get(0);
-            Location chunkLoc = new Location(world, (any.x() & ~15) + 8, center.y(), (any.z() & ~15) + 8);
-            ExplosionResult sub = new ExplosionResult(bucket, List.of());
-            scheduling.runAt(chunkLoc, () -> nms.destroyBlocks(world, sub));
-        }
-        // Knockback: each push on the victim's own region thread.
-        for (EntityPush push : result.pushes()) {
-            Entity victim = nms.resolveEntity(world, push.entityId());
-            if (victim != null) {
-                scheduling.runOn(victim, () -> nms.applyPush(world, push), () -> { });
+    private void applyExplosion(World world, Entity tnt, Vec3d center, List<BlockPos> broken, float power, long seed) {
+        float yield = 1.0f / power;
+        NmsAccess.ExplodeResult exploded = nms.fireEntityExplode(tnt, center, broken, yield);
+        if (!exploded.cancelled()) {
+            // Bucket the (event-filtered) blocks by chunk so each batch applies on its owning region.
+            Map<Long, List<BlockPos>> byChunk = new HashMap<>();
+            for (BlockPos pos : exploded.blocks()) {
+                long key = (((long) (pos.x() >> 4)) << 32) | ((pos.z() >> 4) & 0xFFFFFFFFL);
+                byChunk.computeIfAbsent(key, k -> new ArrayList<>()).add(pos);
+            }
+            int bucketIndex = 0;
+            for (List<BlockPos> bucket : byChunk.values()) {
+                BlockPos any = bucket.get(0);
+                Location chunkLoc = new Location(world, (any.x() & ~15) + 8, center.y(), (any.z() & ~15) + 8);
+                long bucketSeed = seed * 31 + (bucketIndex++);
+                float finalYield = exploded.yield();
+                scheduling.runAt(chunkLoc, () -> nms.destroyBlocks(world, bucket, finalYield, bucketSeed));
             }
         }
         nms.emitExplosionEffects(world, center);
+        nms.removeEntity(tnt);
     }
 
-    // ── falling-block landing (owning thread) ────────────────────────────────
     private void land(EngineBody body) {
         Entity entity = body.entity;
         World world = entity.getWorld();
-        BodyState s = body.state;
-        int bx = Mth.floor(s.x());
-        int by = Mth.floor(s.y());
-        int bz = Mth.floor(s.z());
+        BodyState state = body.state;
         BlockData data = body.fallingBlockData;
-        removeBodyAndEntity(body);
-        if (data == null) {
-            return;
+        body.released = true;
+        if (body.driver != null) {
+            body.driver.cancel();
         }
-        Block block = world.getBlockAt(bx, by, bz);
-        if (block.getType().isAir() || block.isLiquid()) {
-            block.setBlockData(data, true);
-        } else {
-            world.dropItem(new Location(world, bx + 0.5, by + 0.5, bz + 0.5),
-                    new ItemStack(data.getMaterial()));
-        }
+        bodies.remove(entity.getUniqueId());
+        nms.removeEntity(entity);
+        nms.landFallingBlock(world, state, data);
     }
 
-    // ── lifecycle helpers ────────────────────────────────────────────────────
     private void retire(EngineBody body) {
         body.released = true;
         bodies.remove(body.entity.getUniqueId());
@@ -304,12 +317,15 @@ public final class AsyncTntEngine implements EngineHandle {
         }
         Entity entity = body.entity;
         if (entity.isValid()) {
-            // forceVanilla is invoked on the entity's owning thread (command,
-            // kill-switch reaction, or the test sync), so restore immediately —
-            // deferring a tick left a window where the entity stayed neutralized
-            // (gravity off, fuse held) and never resumed vanilla ticking.
+            // forceVanilla runs on the entity's owning thread; restore immediately
+            // so the entity resumes vanilla ticking with no neutralized window.
             nms.restore(entity, body.state);
         }
+    }
+
+    private static int blastRadius(float power) {
+        // Ray reach ~= power * (0.7..1.3) / 0.22500001 * 0.3 ~= power * 1.8; pad by 1 and cap.
+        return Math.min(48, (int) Math.ceil(power * 1.8) + 1);
     }
 
     private static long seedFor(Vec3d center, World world) {

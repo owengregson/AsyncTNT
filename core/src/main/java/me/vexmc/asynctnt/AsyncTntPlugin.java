@@ -35,7 +35,7 @@ public final class AsyncTntPlugin extends JavaPlugin {
                 PhysicsProfile.forVersion(environment.major(), environment.minor(), environment.patch());
 
         ConfigStore config = new ConfigStore(this);
-        NmsAccess nms = new BukkitNmsAccess();
+        NmsAccess nms = new BukkitNmsAccess(this);
 
         this.engine = new AsyncTntEngine(this, scheduling, nms, config::get, profile);
         this.engine.start();
