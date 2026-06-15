@@ -414,7 +414,22 @@ public final class BukkitNmsAccess implements NmsAccess {
     @Override
     public @NotNull Vec3d explosionCenter(@NotNull Entity tnt) {
         Location l = tnt.getLocation();
-        return new Vec3d(l.getX(), l.getY() + 0.0625, l.getZ());
+        // Vanilla PrimedTnt.explode detonates at getY(0.0625) = position.y +
+        // bbHeight * 0.0625. The primed-TNT box is 0.98 tall, so the centre is
+        // +0.06125, NOT a flat +0.0625. The blast ray-march and the entity
+        // seen-percent grid key off this centre, so the sub-cm difference is a
+        // real (if tiny) non-parity that the deterministic oracle now pins.
+        return new Vec3d(l.getX(), l.getY() + 0.98 * 0.0625, l.getZ());
+    }
+
+    @Override
+    public boolean regionOwnsChunkAt(@NotNull World world, double x, double z) {
+        if (!folia) {
+            return true; // Paper: a single tick thread owns everything.
+        }
+        int chunkX = ((int) Math.floor(x)) >> 4;
+        int chunkZ = ((int) Math.floor(z)) >> 4;
+        return reflection.ownedByCurrentRegion(world, chunkX, chunkZ);
     }
 
     @Override
@@ -450,6 +465,17 @@ public final class BukkitNmsAccess implements NmsAccess {
         if (entity instanceof TNTPrimed tnt) {
             tnt.setFuseTicks(HELD_FUSE); // engine owns the real countdown; vanilla must never reach 0
         }
+        // The shadow entity's real velocity is held at zero so vanilla never moves
+        // it; but the CLIENT renders a falling block / TNT by dead-reckoning its
+        // velocity between the tracker's sparse position syncs, so a zero velocity
+        // makes it freeze-then-snap. Hand the client the engine's true velocity to
+        // glide along — render-only, physics untouched, no-op if unresolved.
+        reflection.broadcastVelocity(entity, state.dx(), state.dy(), state.dz());
+    }
+
+    @Override
+    public void broadcastRenderVelocity(@NotNull Entity entity, @NotNull Vec3d velocity) {
+        reflection.broadcastVelocity(entity, velocity.x(), velocity.y(), velocity.z());
     }
 
     @Override

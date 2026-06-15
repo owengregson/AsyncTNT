@@ -60,8 +60,26 @@ public interface NmsAccess {
     /** Explosion centre for a primed TNT: {@code getY(0.0625)}. */
     @NotNull Vec3d explosionCenter(@NotNull Entity tnt);
 
+    /**
+     * Whether the chunk containing {@code (x,z)} is owned by the region thread
+     * currently executing — i.e. whether it is safe to read/move a body there on
+     * this thread. Always true on Paper (one tick thread); on Folia it gates the
+     * engine's single ordered pass so a coordinator only ever ticks bodies its own
+     * region owns. A body in another region is left to its own region's pass.
+     */
+    boolean regionOwnsChunkAt(@NotNull World world, double x, double z);
+
     // ── apply (owning thread) ────────────────────────────────────────────────
     void applyState(@NotNull Entity entity, @NotNull BodyState state);
+
+    /**
+     * Broadcast the engine's velocity to the players tracking this entity so the
+     * client dead-reckons a smooth glide between the sparse server position syncs
+     * (a falling block / primed TNT renders by extrapolating its own velocity).
+     * Render-only: the real server-side velocity stays zero so vanilla physics
+     * never re-consumes it. A no-op where the packet path could not be resolved.
+     */
+    void broadcastRenderVelocity(@NotNull Entity entity, @NotNull Vec3d velocity);
 
     /** Apply one entity's explosion knockback (and damage, for living entities), same-tick. */
     void applyPush(@NotNull Entity victim, @NotNull Vec3d knockback, float damage);

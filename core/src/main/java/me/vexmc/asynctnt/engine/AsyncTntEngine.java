@@ -1,6 +1,7 @@
 package me.vexmc.asynctnt.engine;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -9,6 +10,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
 import org.bukkit.Location;
@@ -61,6 +63,8 @@ public final class AsyncTntEngine implements EngineHandle {
     private final Supplier<AsyncTntConfig> config;
     private final PhysicsProfile profile;
     private final Map<UUID, EngineBody> bodies = new ConcurrentHashMap<>();
+    /** Monotonic spawn-order index — the off-thread analogue of vanilla's entity tick order. */
+    private final AtomicLong spawnOrder = new AtomicLong();
 
     private volatile ExecutorService workers;
     private volatile boolean active;
@@ -165,24 +169,94 @@ public final class AsyncTntEngine implements EngineHandle {
         nms.neutralize(entity);
         BlockData blockData = (!tnt && entity instanceof FallingBlock fb) ? fb.getBlockData() : null;
         EngineBody body = new EngineBody(entity, state, blockData);
+        body.spawnSeq = spawnOrder.getAndIncrement();
         bodies.put(entity.getUniqueId(), body);
 
-        body.driver = scheduling.repeatOn(entity, 1L, 1L, () -> tick(body), () -> retire(body));
+        body.driver = scheduling.repeatOn(entity, 1L, 1L, () -> coordinatedTick(body), () -> retire(body));
         plugin.getServer().getPluginManager().callEvent(new AsyncTntTakeoverEvent(entity));
     }
 
-    private void tick(EngineBody body) {
-        if (body.released || !active) {
+    /**
+     * The per-entity driver callback. Rather than tick only {@code trigger}, the
+     * first body whose driver fires in a given server tick runs ONE ordered pass
+     * over every engine body its region owns — in {@code spawnSeq} order — and the
+     * other bodies' callbacks that tick become no-ops (their slice was already
+     * integrated). This reproduces vanilla's single sequential entity pass: when a
+     * body detonates mid-pass its knockback lands in the victim's {@link BodyState}
+     * immediately, so a victim later in the order consumes it THIS tick (and one
+     * earlier consumes it next tick) — exactly vanilla's same-tick rule, which the
+     * old independent-per-body model could not guarantee (Folia fires the per-entity
+     * schedulers in an unstable order, so a projectile could move before receiving
+     * its launch push and have it eaten by the on-ground damping).
+     *
+     * <p>Region-safe by construction: a coordinator only ever integrates bodies the
+     * current region thread owns ({@link NmsAccess#regionOwnsChunkAt}); a body in
+     * another region is left to that region's own pass. On Paper everything is one
+     * region, so it is a single global ordered pass. Any failure degrades to ticking
+     * just the trigger (legacy behaviour) or returns the body to vanilla — it can
+     * never crash the region.
+     */
+    private void coordinatedTick(EngineBody trigger) {
+        if (trigger.released || !active) {
             return;
         }
+        Entity te = trigger.entity;
+        if (!te.isValid()) {
+            retire(trigger);
+            return;
+        }
+        World world = te.getWorld();
+        if (paused || !config.get().enabledIn(world.getName())) {
+            forceVanilla(te); // runtime pause / kill-switch / per-world disable
+            return;
+        }
+
+        long tick;
+        try {
+            tick = world.getFullTime(); // shared per-tick clock; same value for every callback this tick
+        } catch (Throwable noClock) {
+            stepOne(trigger, world); // no region-safe clock — fall back to a single-body tick
+            return;
+        }
+        if (trigger.lastPassTick == tick) {
+            return; // an earlier coordinator already ran this region's pass this tick
+        }
+
+        List<EngineBody> pass;
+        try {
+            pass = new ArrayList<>();
+            for (EngineBody b : bodies.values()) {
+                if (b.released || b.lastPassTick == tick) {
+                    continue;
+                }
+                if (!nms.regionOwnsChunkAt(world, b.state.x(), b.state.z())) {
+                    continue; // owned by another region — its own pass will tick it
+                }
+                pass.add(b);
+            }
+            pass.sort(Comparator.comparingLong(b -> b.spawnSeq));
+        } catch (Throwable buildFailed) {
+            stepOne(trigger, world); // degrade to a single-body tick
+            return;
+        }
+
+        for (EngineBody b : pass) {
+            if (b.released || b.lastPassTick == tick) {
+                continue; // detonation earlier in the pass may have removed it
+            }
+            b.lastPassTick = tick;
+            stepOne(b, world);
+        }
+    }
+
+    /** Advance one body one tick: integrate, apply, then detonate / land / despawn. Errors return it to vanilla. */
+    private void stepOne(EngineBody body, World world) {
         Entity entity = body.entity;
+        if (body.released) {
+            return;
+        }
         if (!entity.isValid()) {
             retire(body);
-            return;
-        }
-        World world = entity.getWorld();
-        if (paused || !config.get().enabledIn(world.getName())) {
-            forceVanilla(entity); // runtime pause / kill-switch / per-world disable
             return;
         }
         try {
@@ -207,8 +281,8 @@ public final class AsyncTntEngine implements EngineHandle {
      * Advance one tick of physics — fuse/age countdown, gravity, collision,
      * fluids — updating {@link EngineBody#state}. Pure state evolution: it does
      * not move the entity or fire detonation/landing; the returned result says
-     * whether the caller should. Shared by the per-tick driver and the
-     * spawn-tick alignment in {@link #takeOver}.
+     * whether the caller should. Invoked once per body per tick from the ordered
+     * pass in {@link #stepOne}.
      */
     private MotionResult integrate(EngineBody body, World world) {
         BodyState s = body.state;

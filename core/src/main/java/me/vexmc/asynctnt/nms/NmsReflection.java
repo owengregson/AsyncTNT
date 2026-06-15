@@ -3,9 +3,11 @@ package me.vexmc.asynctnt.nms;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.Collection;
 
 import org.bukkit.block.Block;
 import org.bukkit.entity.LivingEntity;
+import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.jetbrains.annotations.Nullable;
 
@@ -298,29 +300,38 @@ final class NmsReflection {
      *
      * @return true if the NMS reposition was applied
      */
+    /**
+     * Resolve the NMS handle for any Bukkit entity, resolving {@code getHandle}
+     * on the shared {@code CraftEntity} base (NOT the concrete subclass: the
+     * subclass override e.g. {@code CraftTNTPrimed.getHandle} is a distinct
+     * Method that throws if invoked on a {@code CraftFallingBlock} or
+     * {@code CraftPlayer}). The base Method dispatches virtually and works for
+     * every entity type, so the same cached Method serves TNT, falling blocks
+     * and players alike.
+     */
+    private Object handle(org.bukkit.entity.Entity entity) throws ReflectiveOperationException {
+        Method getHandle = craftEntityGetHandle;
+        if (getHandle == null) {
+            Class<?> craftEntity = entity.getClass();
+            while (craftEntity != null && !craftEntity.getName().endsWith(".CraftEntity")) {
+                craftEntity = craftEntity.getSuperclass();
+            }
+            Class<?> target = craftEntity != null ? craftEntity : entity.getClass();
+            getHandle = Reflect.noArgMethod(target, "getHandle");
+            if (getHandle == null) {
+                throw new IllegalStateException("CraftEntity.getHandle() not found on " + target);
+            }
+            craftEntityGetHandle = getHandle;
+        }
+        return getHandle.invoke(entity);
+    }
+
     boolean setPos(org.bukkit.entity.Entity entity, double x, double y, double z) {
         if (setPosDisabled) {
             return false;
         }
         try {
-            Method getHandle = craftEntityGetHandle;
-            if (getHandle == null) {
-                // Resolve getHandle on the shared CraftEntity base, NOT the concrete
-                // subclass: the subclass override (CraftTNTPrimed.getHandle) is a
-                // distinct Method that throws if invoked on a CraftFallingBlock. The
-                // base Method dispatches virtually and works for every entity type.
-                Class<?> craftEntity = entity.getClass();
-                while (craftEntity != null && !craftEntity.getName().endsWith(".CraftEntity")) {
-                    craftEntity = craftEntity.getSuperclass();
-                }
-                Class<?> target = craftEntity != null ? craftEntity : entity.getClass();
-                getHandle = Reflect.noArgMethod(target, "getHandle");
-                if (getHandle == null) {
-                    throw new IllegalStateException("CraftEntity.getHandle() not found on " + target);
-                }
-                craftEntityGetHandle = getHandle;
-            }
-            Object handle = getHandle.invoke(entity);
+            Object handle = handle(entity);
             Method setPos = nmsSetPos;
             if (setPos == null) {
                 // setPos is declared on NMS Entity; remap against THAT class (not the
@@ -354,5 +365,156 @@ final class NmsReflection {
                     + failure.getClass().getSimpleName() + "); driving entities with teleport instead.");
             return false;
         }
+    }
+
+    // ── client render velocity: ClientboundSetEntityMotionPacket to the trackers ──
+    // The engine keeps the real server-side deltaMovement at zero (so vanilla never
+    // re-consumes it and moves the shadow entity), but a falling block / primed TNT
+    // renders on the CLIENT by dead-reckoning its velocity (the client runs the
+    // entity's own tick, moving it by its last-known deltaMovement between the sparse
+    // server position syncs). A zero velocity therefore freezes the client render and
+    // it snaps on each periodic position packet. Broadcasting the engine's real
+    // velocity each tick gives the client the vector to glide along — exactly what
+    // vanilla does — without perturbing server physics. Render-only and self-disabling:
+    // a failure degrades to the (cosmetic) snap, never to a physics change.
+    private static final double VELOCITY_CLAMP = 3.9; // motion-packet short encoding caps at ~3.9 b/t
+
+    private volatile boolean broadcastDisabled;
+    private volatile Constructor<?> motionPacketCtor; // ClientboundSetEntityMotionPacket(int, Vec3)
+    private volatile Constructor<?> vec3Ctor;         // Vec3(double, double, double)
+    private volatile boolean trackedByResolved;
+    private volatile Method entityGetTrackedBy;       // Bukkit/Paper Entity#getTrackedBy() (may be absent)
+    private volatile Field serverPlayerConnection;    // ServerPlayer.connection
+    private volatile Method connectionSend;           // ServerPlayerConnection.send(Packet)
+
+    /**
+     * Broadcast {@code (vx,vy,vz)} as this entity's client-side velocity to the
+     * players tracking it, so an engine-driven body glides smoothly instead of
+     * snapping between position syncs. Runs on the entity's owning thread (called
+     * from {@code applyState}); the tracker set / packet send touch only this
+     * region's state. Self-disables on any reflection failure.
+     *
+     * @return true if the broadcast path is live (resolved and attempted)
+     */
+    boolean broadcastVelocity(org.bukkit.entity.Entity entity, double vx, double vy, double vz) {
+        if (broadcastDisabled) {
+            return false;
+        }
+        try {
+            Object packet = motionPacket(entity, vx, vy, vz);
+            for (Player viewer : viewers(entity)) {
+                try {
+                    sendPacket(viewer, packet);
+                } catch (Throwable perViewer) {
+                    // A single off-region / disconnecting viewer must not disable the path.
+                }
+            }
+            return true;
+        } catch (Throwable failure) {
+            broadcastDisabled = true;
+            plugin.getLogger().info("NMS velocity broadcast unavailable on this version ("
+                    + failure.getClass().getSimpleName()
+                    + "); engine-driven entities render on the vanilla tracker cadence.");
+            return false;
+        }
+    }
+
+    private Object motionPacket(org.bukkit.entity.Entity entity, double vx, double vy, double vz)
+            throws ReflectiveOperationException {
+        if (motionPacketCtor == null) {
+            Object handle = handle(entity); // any NMS entity — used only for its classloader
+            ClassLoader cl = handle.getClass().getClassLoader();
+            Class<?> vec3Class = Class.forName(
+                    remapper.remapClassName("net.minecraft.world.phys.Vec3"), true, cl);
+            Constructor<?> v = vec3Class.getConstructor(double.class, double.class, double.class);
+            v.setAccessible(true);
+            vec3Ctor = v;
+            Class<?> packetClass = Class.forName(
+                    remapper.remapClassName("net.minecraft.network.protocol.game.ClientboundSetEntityMotionPacket"),
+                    true, cl);
+            Constructor<?> p = packetClass.getConstructor(int.class, vec3Class);
+            p.setAccessible(true);
+            motionPacketCtor = p;
+        }
+        Object vec = vec3Ctor.newInstance(clamp(vx), clamp(vy), clamp(vz));
+        return motionPacketCtor.newInstance(entity.getEntityId(), vec);
+    }
+
+    /** Players tracking this entity: the exact viewer set via the Paper API where present, else every player in the world. */
+    @SuppressWarnings("unchecked")
+    private Collection<? extends Player> viewers(org.bukkit.entity.Entity entity) {
+        if (!trackedByResolved) {
+            synchronized (this) {
+                if (!trackedByResolved) {
+                    try {
+                        entityGetTrackedBy = org.bukkit.entity.Entity.class.getMethod("getTrackedBy");
+                    } catch (Throwable absent) {
+                        entityGetTrackedBy = null;
+                    }
+                    trackedByResolved = true;
+                }
+            }
+        }
+        Method m = entityGetTrackedBy;
+        if (m != null) {
+            try {
+                Object tracked = m.invoke(entity);
+                if (tracked instanceof Collection<?> c) {
+                    return (Collection<? extends Player>) c;
+                }
+            } catch (Throwable fallThrough) {
+                // older/odd build — fall back to the world player list
+            }
+        }
+        return entity.getWorld().getPlayers();
+    }
+
+    private void sendPacket(Player player, Object packet) throws ReflectiveOperationException {
+        Object serverPlayer = handle(player); // CraftEntity.getHandle dispatches to CraftPlayer -> ServerPlayer
+        Field connField = serverPlayerConnection;
+        if (connField == null) {
+            connField = fieldAny(serverPlayer.getClass(),
+                    remapper.remapFieldName(serverPlayer.getClass(), "connection"),
+                    "connection", "playerConnection", "f");
+            serverPlayerConnection = connField;
+        }
+        Object conn = connField.get(serverPlayer);
+        Method send = connectionSend;
+        if (send == null) {
+            for (String candidate : new String[] {
+                    remapper.remapMethodName(conn.getClass(), "send"), "send", "sendPacket"}) {
+                send = Reflect.methodArity(conn.getClass(), candidate, 1, packet.getClass());
+                if (send != null) {
+                    break;
+                }
+            }
+            if (send == null) {
+                throw new IllegalStateException("ServerPlayerConnection.send(Packet) not found on " + conn.getClass());
+            }
+            connectionSend = send;
+        }
+        send.invoke(conn, packet);
+    }
+
+    private static double clamp(double v) {
+        return v < -VELOCITY_CLAMP ? -VELOCITY_CLAMP : (v > VELOCITY_CLAMP ? VELOCITY_CLAMP : v);
+    }
+
+    private static Field fieldAny(Class<?> owner, String... names) throws NoSuchFieldException {
+        for (Class<?> c = owner; c != null; c = c.getSuperclass()) {
+            for (String name : names) {
+                if (name == null) {
+                    continue;
+                }
+                try {
+                    Field f = c.getDeclaredField(name);
+                    f.setAccessible(true);
+                    return f;
+                } catch (NoSuchFieldException ignored) {
+                    // try the next candidate / superclass
+                }
+            }
+        }
+        throw new NoSuchFieldException(names[names.length - 1] + " on " + owner.getName());
     }
 }

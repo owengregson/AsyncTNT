@@ -81,6 +81,7 @@ public final class ParitySuite {
                 tntKnocksTnt(service),
                 tntKnocksFallingBlock(service),
                 trajectoryParityVsVanilla(service),
+                groundedCannonParity(service),
                 sandThroughWater(service));
     }
 
@@ -278,6 +279,32 @@ public final class ParitySuite {
             new Scenario("sand:beside-x", true, new double[][] {{2, 0, 0, 8}}),
             new Scenario("sand:below(up)", true, new double[][] {{0, -1, 0, 8}}));
 
+    /**
+     * Grounded L-cannon scenarios: the projectile rests on a BEDROCK pad
+     * ({@code onGround == true}) and the charges sit on the pad beside it with
+     * staggered / clustered fuses, so the launch must thread the
+     * gravity→move→drag→ground-damp(0.7,-0.5,0.7) ordering on a grounded body —
+     * exactly the path the open-air probe (altitude 60, never onGround) cannot
+     * exercise, and where a mis-timed push gets eaten by the ground-damp
+     * ("shoots sideways / down into its own hole"). Staged on BEDROCK precisely
+     * so the blast destroys NOTHING: no {@code level.random} ray draw, no
+     * deferred-block-break {@code seenPercent} skew, identical world state in both
+     * runs — the only variable left is push timing, which is what we are pinning.
+     */
+    private static final List<Scenario> GROUNDED_SCENARIOS = List.of(
+            // A staggered barrel: a +x line of charges fires right-to-left, each
+            // 2 ticks after the last, throwing the grounded projectile -x.
+            new Scenario("lcannon:barrel", false,
+                    new double[][] {{1, 0, 0, 8}, {2, 0, 0, 10}, {3, 0, 0, 12}}),
+            // A same-tick cluster hugging the grounded projectile — accumulated
+            // push on a body that is still onGround at the ground-damp check.
+            new Scenario("lcannon:cluster", false,
+                    new double[][] {{1, 0, 0, 8}, {1, 0, 1, 8}, {1, 0, -1, 8}}));
+    // (No grounded SAND scenario: a falling block resting on a solid block lands
+    //  immediately — it ceases to be an entity — so "grounded sand" has no
+    //  trajectory. Sand's falling-block knockback is covered open-air by the
+    //  sand:* scenarios above.)
+
     private static TestCase trajectoryParityVsVanilla(AsyncTntService service) {
         return new TestCase("cannon: full 3D trajectory matches vanilla tick-by-tick", context -> {
             if (!service.isEngineActive()) {
@@ -286,8 +313,8 @@ public final class ParitySuite {
             }
             int ticks = 24;
             for (Scenario sc : TRAJECTORY_SCENARIOS) {
-                double[][] van = recordTrajectory(context, service, false, sc.sand(), sc.charges(), ticks);
-                double[][] eng = recordTrajectory(context, service, true, sc.sand(), sc.charges(), ticks);
+                double[][] van = recordTrajectory(context, service, false, sc.sand(), sc.charges(), ticks, 60.0, false);
+                double[][] eng = recordTrajectory(context, service, true, sc.sand(), sc.charges(), ticks, 60.0, false);
                 double[] vNet = net(van);
                 double[] eNet = net(eng);
                 double dev = maxDeviation(van, eng);
@@ -305,6 +332,68 @@ public final class ParitySuite {
                         sc.label(), dev));
             }
         });
+    }
+
+    /**
+     * The grounded counterpart: the same deterministic, tick-by-tick trajectory
+     * oracle, but the projectile rests on a BEDROCK pad ({@code onGround}) and the
+     * charges sit on the pad with staggered/clustered fuses — the L-cannon
+     * primitive the user reported as misfiring ("shoots sideways / down into its
+     * own hole"). Bedrock means the blast destroys nothing, so the shot is fully
+     * deterministic (no {@code level.random}, no deferred-block-break exposure
+     * skew) and engine-vs-vanilla must agree to floating point. Apex (max-Y) is
+     * checked rather than net displacement, since a launch that rises then falls
+     * back can net negative even when the lift was correct.
+     */
+    private static TestCase groundedCannonParity(AsyncTntService service) {
+        return new TestCase("cannon: grounded L-cannon launch matches vanilla tick-by-tick", context -> {
+            if (!service.isEngineActive()) {
+                context.note("engine off — grounded cannon parity does not apply, skipping");
+                return;
+            }
+            int ticks = 40; // launch + apex + descent
+            double altitude = 8.0; // inside the arena's cleared headroom (121..144); pad placed just under
+            for (Scenario sc : GROUNDED_SCENARIOS) {
+                double[][] van = recordTrajectory(context, service, false, sc.sand(), sc.charges(), ticks, altitude, true);
+                double[][] eng = recordTrajectory(context, service, true, sc.sand(), sc.charges(), ticks, altitude, true);
+                double[] vNet = net(van);
+                double[] eNet = net(eng);
+                double vApex = apexRise(van);
+                double eApex = apexRise(eng);
+                double dev = maxDeviation(van, eng);
+                context.note(String.format(Locale.ROOT,
+                        "%-18s vanilla dXYZ=(%.3f,%.3f,%.3f) apex=%.3f | engine dXYZ=(%.3f,%.3f,%.3f) apex=%.3f | maxDev=%.4f",
+                        sc.label(), vNet[0], vNet[1], vNet[2], vApex, eNet[0], eNet[1], eNet[2], eApex, dev));
+                context.expect(!Double.isNaN(dev),
+                        "scenario " + sc.label() + ": victim vanished in one run but not the other");
+                // The launch's vertical reach must match vanilla (the up-vs-down report).
+                context.expect(sameDirection(vApex, eApex) && Math.abs(vApex - eApex) < 0.05,
+                        String.format(Locale.ROOT,
+                                "scenario %s: launch apex differs from vanilla — vanilla rise=%.3f engine rise=%.3f",
+                                sc.label(), vApex, eApex));
+                context.expect(dev < 0.05, String.format(Locale.ROOT,
+                        "scenario %s: engine grounded-cannon trajectory diverges from vanilla by %.4f blocks "
+                                + "(want < 0.05) — grounded launch ordering not 1:1", sc.label(), dev));
+            }
+        });
+    }
+
+    /** Peak rise above the first sample's Y (apex), across all valid samples; NaN if the victim never appears. */
+    private static double apexRise(double[][] traj) {
+        double base = Double.NaN;
+        double maxY = Double.NaN;
+        for (double[] p : traj) {
+            if (p == null) {
+                continue;
+            }
+            if (Double.isNaN(base)) {
+                base = p[1];
+                maxY = p[1];
+            } else if (p[1] > maxY) {
+                maxY = p[1];
+            }
+        }
+        return Double.isNaN(base) ? Double.NaN : maxY - base;
     }
 
     /** Net displacement {dx,dy,dz} from the first to the last valid sample. */
@@ -354,14 +443,20 @@ public final class ParitySuite {
     /**
      * Records a victim's (x,y,z) every tick for {@code ticks} ticks while the
      * given charges (each {@code {dx,dy,dz,fuse}} relative to the victim)
-     * detonate, high in open air so nothing is destroyed and the shot is fully
-     * deterministic. The victim is a long-fused TNT, or a sand falling block when
-     * {@code victimIsSand}. Returns a per-tick array (null entries once the victim
-     * is gone). {@code engineOn} selects the engine or pristine vanilla (paused).
+     * detonate, and the shot is fully deterministic (no blocks are destroyed, so
+     * no {@code level.random} is consumed). The victim is a long-fused TNT, or a
+     * sand falling block when {@code victimIsSand}. {@code engineOn} selects the
+     * engine or pristine vanilla (paused).
+     *
+     * <p>{@code altitude} is the victim's height above the arena surface. When
+     * {@code grounded} is true a BEDROCK pad is laid just beneath the victim and
+     * charges so the victim rests {@code onGround} (the cannon launch path) while
+     * the indestructible pad keeps the shot destruction-free and deterministic;
+     * when false the victim floats in open air (the free-flight knockback path).
+     * Returns a per-tick array (null entries once the victim is gone).</p>
      */
     private static double[][] recordTrajectory(TestContext context, AsyncTntService service, boolean engineOn,
-            boolean victimIsSand, double[][] charges, int ticks) throws Exception {
-        final double altitude = 60.0;
+            boolean victimIsSand, double[][] charges, int ticks, double altitude, boolean grounded) throws Exception {
         org.bukkit.entity.Entity[] victim = new org.bukkit.entity.Entity[1];
         java.util.List<org.bukkit.entity.Entity> spawned = new java.util.ArrayList<>();
         try {
@@ -378,6 +473,20 @@ public final class ParitySuite {
                 }
                 world.getEntitiesByClass(TNTPrimed.class).forEach(t -> t.remove());
                 world.getEntitiesByClass(FallingBlock.class).forEach(f -> f.remove());
+                if (grounded) {
+                    // A bedrock pad one block under the victim + charges: indestructible
+                    // (the blast destroys nothing → no level.random → deterministic, and
+                    // the world state is identical in both runs so seenPercent matches),
+                    // and it makes the victim rest onGround so the launch threads the
+                    // gravity→move→drag→ground-damp ordering the open-air case never hits.
+                    int padY = (int) Math.floor(centre.getY() + altitude) - 1;
+                    for (int dx = -2; dx <= 6; dx++) {
+                        for (int dz = -3; dz <= 3; dz++) {
+                            world.getBlockAt(centre.getBlockX() + dx, padY, centre.getBlockZ() + dz)
+                                    .setType(Material.BEDROCK, false);
+                        }
+                    }
+                }
                 Location victimLoc = Arena.offset(centre, 0.0, altitude, 0.0);
                 victim[0] = victimIsSand
                         ? Cannon.launchSand(victimLoc, new Vector(0, 0, 0))

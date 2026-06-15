@@ -25,6 +25,13 @@ final class EngineBody {
     @Nullable TaskHandle driver;
     volatile boolean released;
 
+    // Deterministic ordering for the per-region single pass (see AsyncTntEngine.coordinatedTick):
+    // spawnSeq is a monotonic spawn-order index — the off-thread analogue of vanilla's
+    // entity-list tick order — and lastPassTick guards exactly-once integration per server
+    // tick so the several per-entity drivers that fire each tick collapse into one ordered scan.
+    long spawnSeq;
+    volatile long lastPassTick = Long.MIN_VALUE;
+
     EngineBody(Entity entity, BodyState state, @Nullable BlockData fallingBlockData) {
         this.entity = entity;
         this.state = state;
