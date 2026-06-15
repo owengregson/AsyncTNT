@@ -69,6 +69,8 @@ public final class AsyncTntEngine implements EngineHandle {
     private volatile ExecutorService workers;
     private volatile boolean active;
     private volatile boolean paused;
+    /** One-time diagnostic: whether the per-region coordinator is active (getFullTime clock works). */
+    private volatile boolean loggedCoordPath;
 
     public AsyncTntEngine(JavaPlugin plugin, Scheduling scheduling, NmsAccess nms,
                           Supplier<AsyncTntConfig> config, PhysicsProfile profile) {
@@ -215,6 +217,11 @@ public final class AsyncTntEngine implements EngineHandle {
         try {
             tick = world.getFullTime(); // shared per-tick clock; same value for every callback this tick
         } catch (Throwable noClock) {
+            if (!loggedCoordPath) {
+                loggedCoordPath = true;
+                plugin.getLogger().info("Engine tick: per-body fallback (no region clock: "
+                        + noClock.getClass().getSimpleName() + ")");
+            }
             stepOne(trigger, world); // no region-safe clock — fall back to a single-body tick
             return;
         }
@@ -238,6 +245,11 @@ public final class AsyncTntEngine implements EngineHandle {
         } catch (Throwable buildFailed) {
             stepOne(trigger, world); // degrade to a single-body tick
             return;
+        }
+        if (!loggedCoordPath) {
+            loggedCoordPath = true;
+            plugin.getLogger().info("Engine tick: per-region ordered single pass active "
+                    + "(deterministic cannon ordering).");
         }
 
         for (EngineBody b : pass) {

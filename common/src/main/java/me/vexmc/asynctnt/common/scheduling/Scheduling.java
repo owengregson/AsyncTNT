@@ -30,6 +30,16 @@ public interface Scheduling {
 
     @NotNull TaskHandle repeatGlobal(long initialTicks, long periodTicks, @NotNull Runnable task);
 
+    /**
+     * A repeating task anchored to {@code location}'s region — on Folia it runs
+     * on that region's thread (so it may touch entities/blocks there), on Paper
+     * it collapses to the main thread. This is the region-correct repeating
+     * primitive an entity-driving test needs on Folia, where {@link #repeatGlobal}
+     * runs on the global thread and may not touch region state.
+     */
+    @NotNull TaskHandle repeatAt(
+            @NotNull Location location, long initialTicks, long periodTicks, @NotNull Runnable task);
+
     @NotNull TaskHandle repeatOn(
             @NotNull Entity entity,
             long initialTicks,

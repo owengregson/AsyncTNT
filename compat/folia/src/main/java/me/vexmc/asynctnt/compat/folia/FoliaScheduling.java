@@ -58,6 +58,16 @@ public final class FoliaScheduling implements Scheduling {
     }
 
     @Override
+    public @NotNull TaskHandle repeatAt(
+            @NotNull Location location, long initialTicks, long periodTicks, @NotNull Runnable task) {
+        // Region-anchored: runs on the thread that owns location's region, so the
+        // task may legally touch entities/blocks there (what repeatGlobal cannot).
+        ScheduledTask scheduled = Bukkit.getRegionScheduler()
+                .runAtFixedRate(plugin, location, ignored -> task.run(), clampTicks(initialTicks), clampTicks(periodTicks));
+        return new FoliaHandle(scheduled);
+    }
+
+    @Override
     public @NotNull TaskHandle repeatOn(
             @NotNull Entity entity,
             long initialTicks,

@@ -57,6 +57,13 @@ public final class BukkitScheduling implements Scheduling {
     }
 
     @Override
+    public @NotNull TaskHandle repeatAt(
+            @NotNull Location location, long initialTicks, long periodTicks, @NotNull Runnable task) {
+        // Paper: every region is the main thread, so a location-anchored repeat is just a timer.
+        return new BukkitHandle(Bukkit.getScheduler().runTaskTimer(plugin, task, initialTicks, periodTicks));
+    }
+
+    @Override
     public @NotNull TaskHandle repeatOn(
             @NotNull Entity entity,
             long initialTicks,

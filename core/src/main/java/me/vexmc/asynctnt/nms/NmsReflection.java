@@ -387,6 +387,44 @@ final class NmsReflection {
     private volatile Field serverPlayerConnection;    // ServerPlayer.connection
     private volatile Method connectionSend;           // ServerPlayerConnection.send(Packet)
 
+    private volatile boolean needsSyncDisabled;
+    private volatile Field entityNeedsSync;           // Entity.needsSync (Paper)
+
+    /**
+     * Force the entity tracker to broadcast this entity's POSITION this tick by
+     * setting its {@code needsSync} flag. The engine moves the body via {@code
+     * setPos}, but the tracker normally only re-broadcasts position every
+     * {@code updateInterval} ticks (20 for a falling block, 10 for TNT) — far too
+     * sparse, so the client sees it jump. Setting needsSync each tick opens the
+     * tracker's gate so a (relative-move) position packet goes out every tick, and
+     * the client renderer interpolates between consecutive per-tick positions —
+     * the same path by which every normal entity renders smoothly. Tracker-driven,
+     * so it is correct on Folia (the tracker runs on the owning region thread).
+     */
+    void markNeedsSync(org.bukkit.entity.Entity entity) {
+        if (needsSyncDisabled) {
+            return;
+        }
+        try {
+            Object handle = handle(entity);
+            Field f = entityNeedsSync;
+            if (f == null) {
+                Class<?> entityClass = handle.getClass();
+                while (entityClass != null && !entityClass.getName().endsWith(".Entity")) {
+                    entityClass = entityClass.getSuperclass();
+                }
+                Class<?> target = entityClass != null ? entityClass : handle.getClass();
+                f = fieldAny(target, remapper.remapFieldName(target, "needsSync"), "needsSync");
+                entityNeedsSync = f;
+            }
+            f.setBoolean(handle, true);
+        } catch (Throwable failure) {
+            needsSyncDisabled = true;
+            plugin.getLogger().info("NMS needsSync flag unavailable on this version ("
+                    + failure.getClass().getSimpleName() + "); falling back to the tracker's update interval.");
+        }
+    }
+
     /**
      * Broadcast {@code (vx,vy,vz)} as this entity's client-side velocity to the
      * players tracking it, so an engine-driven body glides smoothly instead of

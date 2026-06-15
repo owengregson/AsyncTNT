@@ -9,6 +9,7 @@ import java.util.function.BooleanSupplier;
 import java.util.logging.Logger;
 import me.vexmc.asynctnt.common.scheduling.Scheduling;
 import me.vexmc.asynctnt.common.scheduling.TaskHandle;
+import org.bukkit.Location;
 import org.jetbrains.annotations.NotNull;
 
 /**
@@ -87,6 +88,66 @@ public final class TestContext {
             return done.get(TICK_WAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         } catch (TimeoutException timeout) {
             throw new AssertionError("recordPerTick did not gather " + ticks + " samples — server tick stalled?");
+        } finally {
+            if (handle[0] != null) {
+                handle[0].cancel();
+            }
+        }
+    }
+
+    /**
+     * Runs {@code work} once on the region thread that owns {@code at} and blocks
+     * until it finishes. This is {@link #sync} for Folia: on Folia world/entity
+     * work must run on the owning region thread, which the global {@link #sync}
+     * (global region) may not touch. On Paper both collapse to the main thread.
+     */
+    public void runAtRegion(@NotNull Location at, @NotNull ThrowingRunnable work) throws Exception {
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        scheduling.runAt(at, () -> {
+            try {
+                work.run();
+                future.complete(null);
+            } catch (Throwable failure) {
+                future.completeExceptionally(failure);
+            }
+        });
+        try {
+            future.get(SYNC_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException timeout) {
+            throw new AssertionError("Region work at " + at + " did not complete within "
+                    + SYNC_TIMEOUT_SECONDS + "s — region tick stalled?");
+        }
+    }
+
+    /**
+     * Like {@link #recordPerTick} but sampled on the region thread that owns
+     * {@code at} (Folia-correct: it can read entities there). Samples once per
+     * tick for {@code ticks} ticks at a fixed phase after that region's entity
+     * schedulers — including the engine's per-entity driver — have run.
+     */
+    public <T> java.util.List<T> recordPerTickAt(@NotNull Location at, @NotNull Callable<T> sampler, int ticks)
+            throws Exception {
+        java.util.List<T> samples = new java.util.ArrayList<>();
+        CompletableFuture<java.util.List<T>> done = new CompletableFuture<>();
+        TaskHandle[] handle = new TaskHandle[1];
+        handle[0] = scheduling.repeatAt(at, 1L, 1L, () -> {
+            if (done.isDone()) {
+                return;
+            }
+            try {
+                samples.add(sampler.call());
+            } catch (Throwable failure) {
+                done.completeExceptionally(failure);
+                return;
+            }
+            if (samples.size() >= ticks) {
+                done.complete(samples);
+            }
+        });
+        try {
+            return done.get(TICK_WAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException timeout) {
+            throw new AssertionError("recordPerTickAt did not gather " + ticks + " samples — region tick stalled?");
         } finally {
             if (handle[0] != null) {
                 handle[0].cancel();

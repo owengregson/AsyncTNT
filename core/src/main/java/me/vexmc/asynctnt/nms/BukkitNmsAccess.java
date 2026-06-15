@@ -65,6 +65,8 @@ public final class BukkitNmsAccess implements NmsAccess {
     private final boolean folia;
     /** 0 = untested, 1 = exact NMS reflection trusted, -1 = use the constant table. */
     private volatile int resistanceTrust;
+    /** One-time diagnostic: which movement path applyState actually takes (setPos vs teleport). */
+    private volatile boolean loggedApplyPath;
 
     public BukkitNmsAccess(org.bukkit.plugin.java.JavaPlugin plugin) {
         this(plugin, false);
@@ -461,15 +463,28 @@ public final class BukkitNmsAccess implements NmsAccess {
                 entity.teleportAsync(target);
             }
         }
+        if (!loggedApplyPath) {
+            loggedApplyPath = true;
+            plugin.getLogger().info("Engine movement: " + (moved
+                    ? "NMS setPos (smooth client interpolation)"
+                    : "teleport fallback (client may snap) — folia=" + folia + " regionOwned=" + smooth));
+        }
         entity.setVelocity(new Vector(0, 0, 0));
         if (entity instanceof TNTPrimed tnt) {
             tnt.setFuseTicks(HELD_FUSE); // engine owns the real countdown; vanilla must never reach 0
         }
-        // The shadow entity's real velocity is held at zero so vanilla never moves
-        // it; but the CLIENT renders a falling block / TNT by dead-reckoning its
-        // velocity between the tracker's sparse position syncs, so a zero velocity
-        // makes it freeze-then-snap. Hand the client the engine's true velocity to
-        // glide along — render-only, physics untouched, no-op if unresolved.
+        // Smooth client rendering of an engine-driven body (render-only; physics
+        // untouched; both no-ops if unresolved):
+        //  1. Force a per-tick POSITION broadcast. The tracker otherwise re-syncs
+        //     position only every updateInterval ticks (20 for a falling block),
+        //     so the client jumps; needsSync makes it send every tick and the
+        //     renderer interpolates between consecutive positions (how every entity
+        //     renders smoothly). This is the primary fix and rides the tracker's
+        //     own Folia-safe path.
+        //  2. Hand the client the engine's true velocity so it dead-reckons between
+        //     frames (the shadow entity's real velocity is held at zero so vanilla
+        //     never re-moves it, which would otherwise freeze the client render).
+        reflection.markNeedsSync(entity);
         reflection.broadcastVelocity(entity, state.dx(), state.dy(), state.dz());
     }
 

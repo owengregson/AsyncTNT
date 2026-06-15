@@ -17,3 +17,6 @@ bin/
 
 # OS
 .DS_Store
+
+# Local Folia test server (manual NMS/rendering verification)
+run-folia/
