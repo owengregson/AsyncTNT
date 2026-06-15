@@ -241,4 +241,81 @@ final class NmsReflection {
         }
         kbAttribute = null;
     }
+
+    // ── direct NMS reposition: relative-move packets (smooth) instead of teleport (snap) ──
+    private volatile boolean setPosDisabled;
+    private volatile Method craftEntityGetHandle;
+    private volatile Method nmsSetPos;
+
+    /**
+     * Move the entity by writing its NMS position directly, the way a vanilla
+     * tick does. The entity tracker then emits relative-move packets the client
+     * interpolates smoothly, instead of the absolute teleport packets a Bukkit
+     * {@code teleport} produces (which the client snaps to with no in-between
+     * frames — why an engine-driven falling block appears to jump straight to
+     * its landing spot). {@code setPos} also runs the entity's level callback, so
+     * chunk-section membership stays correct as it crosses chunks.
+     *
+     * <p>Resolved once; on any failure it disables itself and returns false so
+     * the caller falls back to a teleport.
+     *
+     * @return true if the NMS reposition was applied
+     */
+    boolean setPos(org.bukkit.entity.Entity entity, double x, double y, double z) {
+        if (setPosDisabled) {
+            return false;
+        }
+        try {
+            Method getHandle = craftEntityGetHandle;
+            if (getHandle == null) {
+                // Resolve getHandle on the shared CraftEntity base, NOT the concrete
+                // subclass: the subclass override (CraftTNTPrimed.getHandle) is a
+                // distinct Method that throws if invoked on a CraftFallingBlock. The
+                // base Method dispatches virtually and works for every entity type.
+                Class<?> craftEntity = entity.getClass();
+                while (craftEntity != null && !craftEntity.getName().endsWith(".CraftEntity")) {
+                    craftEntity = craftEntity.getSuperclass();
+                }
+                Class<?> target = craftEntity != null ? craftEntity : entity.getClass();
+                getHandle = Reflect.noArgMethod(target, "getHandle");
+                if (getHandle == null) {
+                    throw new IllegalStateException("CraftEntity.getHandle() not found on " + target);
+                }
+                craftEntityGetHandle = getHandle;
+            }
+            Object handle = getHandle.invoke(entity);
+            Method setPos = nmsSetPos;
+            if (setPos == null) {
+                // setPos is declared on NMS Entity; remap against THAT class (not the
+                // TNT/falling-block subclass) so the inherited name resolves on
+                // spigot-mapped versions. Try the remapped name, then the literal
+                // Mojang/legacy names as a fallback.
+                Class<?> entityClass = handle.getClass();
+                while (entityClass != null && !entityClass.getName().endsWith(".Entity")) {
+                    entityClass = entityClass.getSuperclass();
+                }
+                Class<?> remapTarget = entityClass != null ? entityClass : handle.getClass();
+                for (String candidate : new String[] {
+                        remapper.remapMethodName(remapTarget, "setPos"), "setPos", "setPosition"}) {
+                    setPos = Reflect.methodArity(handle.getClass(), candidate, 3,
+                            double.class, double.class, double.class);
+                    if (setPos != null) {
+                        break;
+                    }
+                }
+                if (setPos == null) {
+                    throw new IllegalStateException(
+                            "Entity.setPos(double,double,double) not found on " + handle.getClass());
+                }
+                nmsSetPos = setPos;
+            }
+            setPos.invoke(handle, x, y, z);
+            return true;
+        } catch (Throwable failure) {
+            setPosDisabled = true;
+            plugin.getLogger().info("NMS setPos unavailable on this version ("
+                    + failure.getClass().getSimpleName() + "); driving entities with teleport instead.");
+            return false;
+        }
+    }
 }

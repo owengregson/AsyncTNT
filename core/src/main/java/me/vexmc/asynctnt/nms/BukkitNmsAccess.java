@@ -62,11 +62,17 @@ public final class BukkitNmsAccess implements NmsAccess {
 
     private final NmsReflection reflection;
     private final org.bukkit.plugin.java.JavaPlugin plugin;
+    private final boolean folia;
     /** 0 = untested, 1 = exact NMS reflection trusted, -1 = use the constant table. */
     private volatile int resistanceTrust;
 
     public BukkitNmsAccess(org.bukkit.plugin.java.JavaPlugin plugin) {
+        this(plugin, false);
+    }
+
+    public BukkitNmsAccess(org.bukkit.plugin.java.JavaPlugin plugin, boolean folia) {
         this.plugin = plugin;
+        this.folia = folia;
         this.reflection = new NmsReflection(plugin);
     }
 
@@ -401,13 +407,22 @@ public final class BukkitNmsAccess implements NmsAccess {
 
     @Override
     public void applyState(@NotNull Entity entity, @NotNull BodyState state) {
-        Location current = entity.getLocation();
-        Location target = new Location(entity.getWorld(), state.x(), state.y(), state.z(),
-                current.getYaw(), current.getPitch());
-        try {
-            entity.teleport(target);
-        } catch (UnsupportedOperationException folia) {
-            entity.teleportAsync(target);
+        // Prefer a direct NMS reposition: it emits relative-move packets the client
+        // interpolates (smooth flight/fall), whereas a Bukkit teleport emits an
+        // absolute teleport packet the client snaps to — which is why an
+        // engine-driven falling block looked like it jumped to its landing spot.
+        // On Folia we keep the region-aware async teleport: a fast body can cross a
+        // region boundary in one tick and only teleportAsync handles that safely.
+        boolean moved = !folia && reflection.setPos(entity, state.x(), state.y(), state.z());
+        if (!moved) {
+            Location current = entity.getLocation();
+            Location target = new Location(entity.getWorld(), state.x(), state.y(), state.z(),
+                    current.getYaw(), current.getPitch());
+            try {
+                entity.teleport(target);
+            } catch (UnsupportedOperationException foliaTeleport) {
+                entity.teleportAsync(target);
+            }
         }
         entity.setVelocity(new Vector(0, 0, 0));
         if (entity instanceof TNTPrimed tnt) {
