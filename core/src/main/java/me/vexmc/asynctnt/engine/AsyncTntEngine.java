@@ -303,9 +303,12 @@ public final class AsyncTntEngine implements EngineHandle {
             body.driver.cancel();
         }
         Entity entity = body.entity;
-        BodyState state = body.state;
         if (entity.isValid()) {
-            scheduling.runOn(entity, () -> nms.restore(entity, state), () -> { });
+            // forceVanilla is invoked on the entity's owning thread (command,
+            // kill-switch reaction, or the test sync), so restore immediately —
+            // deferring a tick left a window where the entity stayed neutralized
+            // (gravity off, fuse held) and never resumed vanilla ticking.
+            nms.restore(entity, body.state);
         }
     }
 

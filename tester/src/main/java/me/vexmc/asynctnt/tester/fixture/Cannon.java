@@ -44,13 +44,15 @@ public final class Cannon {
     public static @NotNull TNTPrimed primeTnt(
             @NotNull Location at, @NotNull Vector velocity, int fuseTicks) {
         World world = at.getWorld();
-        TNTPrimed tnt = world.spawn(at, TNTPrimed.class);
-        // Replace the spawn kick (and any momentum the spawn applied) with the
-        // caller's exact vector — setVelocity overwrites, so the random ±0.02
-        // scatter is gone identically regardless of the engine's fork-fix flags.
-        tnt.setVelocity(velocity.clone());
-        tnt.setFuseTicks(fuseTicks);
-        return tnt;
+        // Set velocity + fuse via the pre-spawn consumer so they are in place
+        // BEFORE EntitySpawnEvent fires — the engine reads the body's state at
+        // that event, so a post-spawn setFuseTicks would be invisible to it
+        // (the entity would keep the default fuse 80). The consumer also kills
+        // vanilla's random ±0.02 spawn kick identically on both sides.
+        return world.spawn(at, TNTPrimed.class, tnt -> {
+            tnt.setVelocity(velocity.clone());
+            tnt.setFuseTicks(fuseTicks);
+        });
     }
 
     /**
