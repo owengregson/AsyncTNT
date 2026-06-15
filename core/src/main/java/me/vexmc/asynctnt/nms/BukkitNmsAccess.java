@@ -423,9 +423,19 @@ public final class BukkitNmsAccess implements NmsAccess {
         // interpolates (smooth flight/fall), whereas a Bukkit teleport emits an
         // absolute teleport packet the client snaps to — which is why an
         // engine-driven falling block looked like it jumped to its landing spot.
-        // On Folia we keep the region-aware async teleport: a fast body can cross a
-        // region boundary in one tick and only teleportAsync handles that safely.
-        boolean moved = !folia && reflection.setPos(entity, state.x(), state.y(), state.z());
+        // On Folia this is safe only when the destination chunk is owned by the
+        // region currently ticking (the usual case — a falling block moves within
+        // one region); a move that would cross a region boundary falls through to
+        // the region-aware async teleport, which hands the entity off correctly.
+        boolean smooth;
+        if (folia) {
+            int chunkX = ((int) Math.floor(state.x())) >> 4;
+            int chunkZ = ((int) Math.floor(state.z())) >> 4;
+            smooth = reflection.ownedByCurrentRegion(entity.getWorld(), chunkX, chunkZ);
+        } else {
+            smooth = true;
+        }
+        boolean moved = smooth && reflection.setPos(entity, state.x(), state.y(), state.z());
         if (!moved) {
             Location current = entity.getLocation();
             Location target = new Location(entity.getWorld(), state.x(), state.y(), state.z(),

@@ -242,6 +242,43 @@ final class NmsReflection {
         kbAttribute = null;
     }
 
+    // ── Folia region ownership: may we touch this chunk on the current thread? ──
+    private volatile boolean ownershipResolved;
+    private volatile Method isOwnedByCurrentRegion;
+
+    /**
+     * On Folia, whether the chunk at {@code (chunkX, chunkZ)} is owned by the
+     * region currently ticking — i.e. whether it is safe to reposition an entity
+     * into it directly on this thread (a within-region move) rather than via a
+     * cross-region async teleport. Reached reflectively because core compiles
+     * against the 1.17 API floor, which has no Folia methods. Returns false when
+     * the method is absent (paged callers only consult this on Folia anyway).
+     */
+    boolean ownedByCurrentRegion(org.bukkit.World world, int chunkX, int chunkZ) {
+        if (!ownershipResolved) {
+            synchronized (this) {
+                if (!ownershipResolved) {
+                    try {
+                        isOwnedByCurrentRegion = org.bukkit.Bukkit.class.getMethod(
+                                "isOwnedByCurrentRegion", org.bukkit.World.class, int.class, int.class);
+                    } catch (Throwable absent) {
+                        isOwnedByCurrentRegion = null;
+                    }
+                    ownershipResolved = true;
+                }
+            }
+        }
+        Method m = isOwnedByCurrentRegion;
+        if (m == null) {
+            return false;
+        }
+        try {
+            return Boolean.TRUE.equals(m.invoke(null, world, chunkX, chunkZ));
+        } catch (Throwable failure) {
+            return false;
+        }
+    }
+
     // ── direct NMS reposition: relative-move packets (smooth) instead of teleport (snap) ──
     private volatile boolean setPosDisabled;
     private volatile Method craftEntityGetHandle;
