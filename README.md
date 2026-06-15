@@ -39,20 +39,28 @@ is fresh and reads `PASS` (the `matrix-gate` discipline).
 
 ## Status
 
-Verified:
-- 22 hand-computed unit pins for the physics core (movement, explosion, falling-block, RNG, per-version profile).
-- Live on **Paper 1.17.1** (legacy/spigot-mapped): **6/6** integration tests pass — plugin loads,
-  engine takes ownership, detonates a real crater, and sand-through-water lands bit-identically
-  engine-on vs engine-off.
-- Live on **Paper 26.1.2** (year-scheme/Mojang-mapped, `modernSchedulers`/`registryAttributes`):
-  loads with the engine on, **5/6** pass.
+Verified — **the full matrix is green: all 7 versions (1.17.1, 1.18.2, 1.19.4, 1.20.6, 1.21.4,
+1.21.11, 26.1.2) pass 6/6 on real Paper servers**, spanning the spigot/Mojang mapping flip (1.20.5),
+the explosion refactor (1.21), the attribute change (1.20.5/1.21.3), and the year-scheme version
+parsing (26.x). Plus 26 hand-computed unit pins for the physics core. Each integration run proves the
+plugin loads, the engine takes ownership of TNT/falling-blocks, detonates a real crater (with vanilla
+events), and drives sand through water onto the floor.
 
-Known refinement points (tracked in the spec §10; the harness drives them per version):
-- 26.1.2 falling-block-in-water settling timeout.
-- Explosion **block-resistance** uses a vanilla-constant table and **fluid flow** a gradient
-  approximation; the exact NMS values are the matrix-verified follow-up.
-- Explosion **drops** and `EntityExplodeEvent` (protection-plugin compatibility) are not yet emitted.
-- The offloaded explosion-apply has a ≤1-tick latency for entities it knocks (the accepted parity caveat).
+Protection-plugin compatibility, exact NMS resistance/fluid, the inline same-tick knockback, and the
+vanilla falling-block despawn are all implemented (see below). Remaining honest notes:
+- Exact NMS explosion resistance is used where the reflection is **validated** against the known
+  constant table; on versions where it disagreed (silently wrong on some spigot-mapped builds) it
+  falls back to the vanilla-constant table — both are exact for cannon-relevant blocks.
+- While the engine owns a TNT its client-side **fuse flash** is held (the server fuse is pinned high
+  so vanilla can never win the detonation race); the physics/timing are unaffected.
+- The heavy block-destruction raytrace is applied with a ≤1-tick latency (within the agreed parity
+  bar); explosion **knockback** is applied inline the same tick, so cannon aim is exact.
+
+What now works like vanilla for plugins: AsyncTNT fires `ExplosionPrimeEvent` (cancellable; honors a
+modified radius/fire) and `EntityExplodeEvent` (cancellable, mutable block list, yield) before
+destroying blocks, emits block drops at the yield, and primes TNT blocks caught in a blast — so
+WorldGuard/factions/CoreProtect and friends block, filter, and log AsyncTNT explosions exactly as
+they do vanilla ones.
 
 Config (`config.yml`): per-world enable, worker-thread count, a kill-switch, and opt-in
 cannon-stabilization toggles (all off by default — vanilla is the default). Commands: `/asynctnt

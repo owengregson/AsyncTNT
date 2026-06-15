@@ -117,6 +117,13 @@ public final class Arena {
         for (int cx = (BASE_X - half) >> 4; cx <= (BASE_X + half) >> 4; cx++) {
             for (int cz = (BASE_Z - half) >> 4; cz <= (BASE_Z + half) >> 4; cz++) {
                 world.getChunkAt(cx, cz).load();
+                // FORCE-load: a headless test server has no player to keep the
+                // chunk loaded, so its no-player ticket expires within ~20 ticks
+                // and removes a still-flying entity (the 20-tick TNT outlived it
+                // on 1.19.4 / 1.20.6, while the faster sand landed first). Real
+                // cannons fire in player-loaded chunks; force-loading reproduces
+                // that so the parity scenario can actually observe the detonation.
+                world.setChunkForceLoaded(cx, cz, true);
             }
         }
     }

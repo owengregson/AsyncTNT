@@ -52,12 +52,53 @@ import me.vexmc.asynctnt.common.snapshot.FluidView;
  */
 public final class BukkitNmsAccess implements NmsAccess {
 
-    private static final int HELD_FUSE_FLOOR = 4;
+    /**
+     * Vanilla fuse held high while the engine owns the TNT, so the server can
+     * never win the fuse-countdown race and detonate it itself (which it could
+     * with a small held value — version-dependent tick ordering let vanilla
+     * reach 0 first on 1.19.4 / 1.20.6). The engine detonates from its own fuse.
+     */
+    private static final int HELD_FUSE = 72_000;
 
     private final NmsReflection reflection;
+    private final org.bukkit.plugin.java.JavaPlugin plugin;
+    /** 0 = untested, 1 = exact NMS reflection trusted, -1 = use the constant table. */
+    private volatile int resistanceTrust;
 
     public BukkitNmsAccess(org.bukkit.plugin.java.JavaPlugin plugin) {
+        this.plugin = plugin;
         this.reflection = new NmsReflection(plugin);
+    }
+
+    /**
+     * Exact NMS resistance where the reflection is proven reliable, else the
+     * vanilla-constant table. The reflection is validated once against a
+     * table-known block: it silently returns wrong values on some spigot-mapped
+     * versions (1.19.4 / 1.20.6 observed), so we trust it only where it agrees
+     * with the known constant, falling back to the table everywhere else.
+     */
+    private float resistanceFor(Block block, Material m) {
+        if (resistanceTrust == -1) {
+            return blastResistance(m);
+        }
+        float exact = reflection.explosionResistance(block);
+        if (Float.isNaN(exact)) {
+            return blastResistance(m); // reflection unavailable for this block
+        }
+        if (resistanceTrust == 0) {
+            Float known = RESISTANCE.get(m);
+            if (known != null) {
+                if (Math.abs(exact - known) <= Math.max(2.0f, known)) {
+                    resistanceTrust = 1;
+                } else {
+                    resistanceTrust = -1;
+                    plugin.getLogger().info("Exact NMS explosion resistance disagrees with the known "
+                            + m + " constant (" + exact + " vs " + known + "); using the constant table.");
+                    return blastResistance(m);
+                }
+            }
+        }
+        return exact;
     }
 
     @Override
@@ -117,8 +158,21 @@ public final class BukkitNmsAccess implements NmsAccess {
                     for (int y = minY; y <= maxY; y++) {
                         for (int z = minZ; z <= maxZ; z++) {
                             Block b = world.getBlockAt(x, y, z);
-                            if (!b.isPassable() && !b.isEmpty()) {
-                                BoundingBox bb = b.getBoundingBox();
+                            Material m = b.getType();
+                            // Liquids and air never collide (TNT/sand fall through). A block is a
+                            // collider if it is solid OR not passable — relying on Material.isSolid()
+                            // as well as isPassable() because isPassable() proved unreliable for
+                            // some solids on 1.19.4 / 1.20.6 (bodies tunnelled through the floor).
+                            if (m.isAir() || b.isLiquid()) {
+                                continue;
+                            }
+                            if (b.isPassable() && !m.isSolid()) {
+                                continue;
+                            }
+                            BoundingBox bb = b.getBoundingBox();
+                            if (bb == null || bb.getVolume() < 1.0E-9) {
+                                out.add(new Aabb(x, y, z, x + 1.0, y + 1.0, z + 1.0)); // degenerate -> full cube
+                            } else {
                                 out.add(new Aabb(bb.getMinX(), bb.getMinY(), bb.getMinZ(),
                                         bb.getMaxX(), bb.getMaxY(), bb.getMaxZ()));
                             }
@@ -225,12 +279,7 @@ public final class BukkitNmsAccess implements NmsAccess {
                     Material m = block.getType();
                     boolean isAir = m.isAir();
                     air[i] = isAir;
-                    if (isAir) {
-                        resistance[i] = Float.NaN;
-                    } else {
-                        float exact = reflection.explosionResistance(block);
-                        resistance[i] = Float.isNaN(exact) ? blastResistance(m) : exact;
-                    }
+                    resistance[i] = isAir ? Float.NaN : resistanceFor(block, m);
                     destroyable[i] = !isAir && isDestroyable(m);
                 }
             }
@@ -362,7 +411,7 @@ public final class BukkitNmsAccess implements NmsAccess {
         }
         entity.setVelocity(new Vector(0, 0, 0));
         if (entity instanceof TNTPrimed tnt) {
-            tnt.setFuseTicks(Math.max(HELD_FUSE_FLOOR, state.fuseOrTime()));
+            tnt.setFuseTicks(HELD_FUSE); // engine owns the real countdown; vanilla must never reach 0
         }
     }
 
