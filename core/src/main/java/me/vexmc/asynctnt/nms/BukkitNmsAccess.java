@@ -349,12 +349,24 @@ public final class BukkitNmsAccess implements NmsAccess {
             boolean living = e instanceof LivingEntity;
             Location feetLoc = e.getLocation();
             Vec3d feet = new Vec3d(feetLoc.getX(), feetLoc.getY(), feetLoc.getZ());
-            Vec3d eye = feet;
+            BoundingBox bb = e.getBoundingBox();
+            // Knockback direction origin (vanilla ServerExplosion): primed TNT uses
+            // getY() (feet); EVERY other entity uses getEyeY(). For living entities
+            // that's getEyeLocation(); for non-living non-TNT bodies — a falling
+            // block (sand/gravel), an item, … — it is feet + eyeHeight, and the
+            // scalable dimensions those use put the eye at 0.85 * box height
+            // (e.g. a 0.98-tall falling block => +0.833). Using feet here instead
+            // pushed falling blocks DOWN where vanilla pushes them UP.
+            Vec3d eye;
             if (living) {
                 Location eyeLoc = ((LivingEntity) e).getEyeLocation();
                 eye = new Vec3d(eyeLoc.getX(), eyeLoc.getY(), eyeLoc.getZ());
+            } else if (tnt) {
+                eye = feet; // unused for TNT (knockbackOrigin returns feet), kept consistent
+            } else {
+                double eyeHeight = (bb.getMaxY() - bb.getMinY()) * 0.85;
+                eye = new Vec3d(feetLoc.getX(), feetLoc.getY() + eyeHeight, feetLoc.getZ());
             }
-            BoundingBox bb = e.getBoundingBox();
             Aabb box = new Aabb(bb.getMinX(), bb.getMinY(), bb.getMinZ(), bb.getMaxX(), bb.getMaxY(), bb.getMaxZ());
             double kbResist = living ? reflection.explosionKnockbackResistance((LivingEntity) e) : 0.0;
             double seen = seenPercent(world, center, bb);

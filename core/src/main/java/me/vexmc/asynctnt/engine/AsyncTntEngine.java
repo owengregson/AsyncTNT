@@ -167,21 +167,6 @@ public final class AsyncTntEngine implements EngineHandle {
         EngineBody body = new EngineBody(entity, state, blockData);
         bodies.put(entity.getUniqueId(), body);
 
-        // Tick-clock alignment: vanilla ticks a freshly-ignited TNT/falling block
-        // on the SAME server tick it appears, but our per-entity driver's first
-        // run is the NEXT tick. Advance one tick of physics now (fuse countdown +
-        // motion) so detonation and movement land on the same tick vanilla's
-        // would — without this every body lags vanilla by exactly one tick, which
-        // is invisible for a lone TNT but makes timing-tuned cannons drift badly.
-        // No teleport or detonation happens here (we ignore the result): we must
-        // not move the entity or explode re-entrantly during its own spawn event;
-        // the driver applies state and acts on any terminal flag next tick.
-        try {
-            integrate(body, entity.getWorld());
-        } catch (Throwable alignFailure) {
-            plugin.getLogger().warning("AsyncTNT spawn-tick alignment failed; body lags one tick: " + alignFailure);
-        }
-
         body.driver = scheduling.repeatOn(entity, 1L, 1L, () -> tick(body), () -> retire(body));
         plugin.getServer().getPluginManager().callEvent(new AsyncTntTakeoverEvent(entity));
     }

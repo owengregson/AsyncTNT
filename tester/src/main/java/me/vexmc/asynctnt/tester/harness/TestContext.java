@@ -55,6 +55,45 @@ public final class TestContext {
         });
     }
 
+    /**
+     * Samples {@code sampler} exactly once per server tick for {@code ticks}
+     * ticks and returns the readings in order. Unlike a {@code sync}+{@code
+     * awaitTicks} loop — which round-trips to the off-thread driver each
+     * iteration and so cannot pin a reading to a specific physics tick — this
+     * runs entirely in one repeating main-thread task, giving one deterministic
+     * reading per tick at a fixed phase (after the engine's per-entity driver,
+     * which was registered earlier, has applied that tick's state). That
+     * determinism is what makes a tick-by-tick trajectory comparison meaningful.
+     */
+    public <T> java.util.List<T> recordPerTick(@NotNull Callable<T> sampler, int ticks) throws Exception {
+        java.util.List<T> samples = new java.util.ArrayList<>();
+        CompletableFuture<java.util.List<T>> done = new CompletableFuture<>();
+        TaskHandle[] handle = new TaskHandle[1];
+        handle[0] = scheduling.repeatGlobal(1L, 1L, () -> {
+            if (done.isDone()) {
+                return;
+            }
+            try {
+                samples.add(sampler.call());
+            } catch (Throwable failure) {
+                done.completeExceptionally(failure);
+                return;
+            }
+            if (samples.size() >= ticks) {
+                done.complete(samples);
+            }
+        });
+        try {
+            return done.get(TICK_WAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException timeout) {
+            throw new AssertionError("recordPerTick did not gather " + ticks + " samples — server tick stalled?");
+        } finally {
+            if (handle[0] != null) {
+                handle[0].cancel();
+            }
+        }
+    }
+
     public void awaitTicks(int ticks) throws InterruptedException {
         CountDownLatch latch = new CountDownLatch(ticks);
         TaskHandle[] handle = new TaskHandle[1];
