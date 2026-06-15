@@ -218,7 +218,21 @@ public final class AsyncTntEngine implements EngineHandle {
         // Inline, same-tick knockback (cannon aim) — RNG-free, applied to live entities.
         for (NmsAccess.ExplosionTarget target : nms.captureExplosionTargets(world, center, power * 2.0, tnt.getEntityId())) {
             EntityPush push = ExplosionSolver.knockbackFor(center, power, target.snapshot());
-            if (push != null) {
+            if (push == null) {
+                continue;
+            }
+            EngineBody victimBody = bodies.get(target.entity().getUniqueId());
+            if (victimBody != null) {
+                // The victim is engine-owned (another TNT/falling block — e.g. a
+                // cannon's projectile). Its shadow entity's Bukkit velocity is
+                // zeroed by its own applyState every tick and the engine drives
+                // motion from this authoritative state, so the knockback MUST be
+                // added here, not via setVelocity. This is what makes cannons fire.
+                BodyState vs = victimBody.state;
+                victimBody.state = vs.withMotion(vs.motion().add(push.knockback()));
+            } else {
+                // Not engine-owned (player, mob, item, …): vanilla ticks it, so the
+                // Bukkit velocity (and damage) is the right place.
                 nms.applyPush(target.entity(), push.knockback(), push.damage());
             }
         }

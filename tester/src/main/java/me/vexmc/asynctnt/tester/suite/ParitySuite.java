@@ -78,6 +78,8 @@ public final class ParitySuite {
         return List.of(
                 ownershipLifecycle(service),
                 cannonParity(service),
+                tntKnocksTnt(service),
+                tntKnocksFallingBlock(service),
                 sandThroughWater(service));
     }
 
@@ -122,6 +124,116 @@ public final class ParitySuite {
                 context.syncRun(() -> {
                     if (tnt[0] != null && tnt[0].isValid()) {
                         tnt[0].remove();
+                    }
+                });
+            }
+        });
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  TNT-on-TNT / TNT-on-sand knockback (the cannon primitive)          */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The core cannon mechanic: an explosion must LAUNCH a nearby primed TNT.
+     * A charge detonates two blocks east of a long-fused victim TNT in open air;
+     * the victim must be knocked west by a real distance. This is what makes
+     * cannons fire — and it is exactly what was broken (the knockback was being
+     * written to the shadow entity's Bukkit velocity, which the engine zeroes
+     * every tick while driving motion from its own authoritative state).
+     */
+    private static TestCase tntKnocksTnt(AsyncTntService service) {
+        return new TestCase("cannon: an explosion launches a nearby primed TNT", context -> {
+            if (!service.isEngineActive()) {
+                context.note("engine off — TNT-on-TNT knockback does not apply, skipping");
+                return;
+            }
+            TNTPrimed[] victim = new TNTPrimed[1];
+            TNTPrimed[] charge = new TNTPrimed[1];
+            double[] startX = new double[1];
+            try {
+                context.syncRun(() -> {
+                    World world = Bukkit.getWorlds().get(0);
+                    Location centre = Arena.prepare(world);
+                    Location victimLoc = Arena.offset(centre, 0.0, 8.0, 0.0);  // open air
+                    Location chargeLoc = Arena.offset(centre, 2.0, 8.0, 0.0);  // 2 blocks east, same Y
+                    victim[0] = Cannon.primeTnt(victimLoc, new Vector(0, 0, 0), 100); // long fuse: survives the blast
+                    charge[0] = Cannon.primeTnt(chargeLoc, new Vector(0, 0, 0), 6);    // short fuse: goes off first
+                    startX[0] = victimLoc.getX();
+                });
+
+                context.awaitUntil(() -> charge[0] == null || !charge[0].isValid(), 60, "charge TNT to detonate");
+                context.awaitTicks(8); // let the launched victim travel
+
+                double endX = context.sync(() -> victim[0].isValid() ? victim[0].getLocation().getX() : Double.NaN);
+                context.expect(!Double.isNaN(endX), "victim TNT vanished before its knockback could be measured");
+
+                double awayWest = startX[0] - endX; // charge is +X (east); knockback is -X (west) => positive
+                context.note(String.format(Locale.ROOT,
+                        "TNT-on-TNT knockback: victim x %.3f -> %.3f (launched %.3f blocks away from the charge)",
+                        startX[0], endX, awayWest));
+                context.expect(awayWest > 1.0, "the explosion did not launch the nearby TNT (moved "
+                        + String.format(Locale.ROOT, "%.3f", awayWest)
+                        + " blocks, expected > 1.0) — TNT-on-TNT knockback is broken; cannons cannot fire");
+            } finally {
+                context.syncRun(() -> {
+                    if (victim[0] != null && victim[0].isValid()) {
+                        victim[0].remove();
+                    }
+                    if (charge[0] != null && charge[0].isValid()) {
+                        charge[0].remove();
+                    }
+                });
+            }
+        });
+    }
+
+    /**
+     * The other half of a factions cannon: an explosion must launch a falling
+     * SAND block (the projectile that punches through water walls). Same staging
+     * as {@link #tntKnocksTnt} with a sand victim — falling blocks are
+     * engine-owned too, so the same knockback path must reach their state.
+     */
+    private static TestCase tntKnocksFallingBlock(AsyncTntService service) {
+        return new TestCase("cannon: an explosion launches a nearby falling block", context -> {
+            if (!service.isEngineActive()) {
+                context.note("engine off — explosion-vs-falling-block knockback does not apply, skipping");
+                return;
+            }
+            FallingBlock[] victim = new FallingBlock[1];
+            TNTPrimed[] charge = new TNTPrimed[1];
+            double[] startX = new double[1];
+            try {
+                context.syncRun(() -> {
+                    World world = Bukkit.getWorlds().get(0);
+                    Location centre = Arena.prepare(world);
+                    Location victimLoc = Arena.offset(centre, 0.0, 8.0, 0.0);
+                    Location chargeLoc = Arena.offset(centre, 2.0, 8.0, 0.0);
+                    victim[0] = Cannon.launchSand(victimLoc, new Vector(0, 0, 0));
+                    charge[0] = Cannon.primeTnt(chargeLoc, new Vector(0, 0, 0), 6);
+                    startX[0] = victimLoc.getX();
+                });
+
+                context.awaitUntil(() -> charge[0] == null || !charge[0].isValid(), 60, "charge TNT to detonate");
+                context.awaitTicks(8);
+
+                double endX = context.sync(() -> victim[0].isValid() ? victim[0].getLocation().getX() : Double.NaN);
+                context.expect(!Double.isNaN(endX), "victim sand vanished before its knockback could be measured");
+
+                double awayWest = startX[0] - endX;
+                context.note(String.format(Locale.ROOT,
+                        "TNT-on-sand knockback: victim x %.3f -> %.3f (launched %.3f blocks away from the charge)",
+                        startX[0], endX, awayWest));
+                context.expect(awayWest > 1.0, "the explosion did not launch the nearby falling block (moved "
+                        + String.format(Locale.ROOT, "%.3f", awayWest)
+                        + " blocks, expected > 1.0) — explosion knockback to engine-owned falling blocks is broken");
+            } finally {
+                context.syncRun(() -> {
+                    if (victim[0] != null && victim[0].isValid()) {
+                        victim[0].remove();
+                    }
+                    if (charge[0] != null && charge[0].isValid()) {
+                        charge[0].remove();
                     }
                 });
             }

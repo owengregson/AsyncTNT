@@ -17,7 +17,11 @@ final class EngineBody {
 
     final Entity entity;
     final @Nullable BlockData fallingBlockData;
-    BodyState state;
+    // Volatile: usually written by this body's own driver, but an explosion in
+    // another body's detonation also adds knockback to it (possibly from a
+    // different region thread on Folia) — the immutable BodyState reference is
+    // swapped atomically, so a concurrent read sees a consistent old-or-new value.
+    volatile BodyState state;
     @Nullable TaskHandle driver;
     volatile boolean released;
 
