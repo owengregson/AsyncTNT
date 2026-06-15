@@ -23,4 +23,15 @@ public interface EngineHandle {
 
     /** The active scheduling backend: "folia" or "bukkit". */
     @NotNull String schedulingBackend();
+
+    /**
+     * Runtime pause: when paused the engine stops claiming new TNT/falling
+     * blocks and releases everything it owns back to vanilla ticking (a
+     * non-persistent kill-switch, and the way the parity oracle runs a pristine
+     * vanilla control in the same world).
+     */
+    void setPaused(boolean paused);
+
+    /** Whether the engine is currently paused. */
+    boolean isPaused();
 }

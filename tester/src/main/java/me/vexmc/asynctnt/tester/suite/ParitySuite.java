@@ -80,6 +80,8 @@ public final class ParitySuite {
                 cannonParity(service),
                 tntKnocksTnt(service),
                 tntKnocksFallingBlock(service),
+                chainedKnockbackMatchesVanilla(service),
+                staggeredChainMatchesVanilla(service),
                 sandThroughWater(service));
     }
 
@@ -238,6 +240,211 @@ public final class ParitySuite {
                 });
             }
         });
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  Chained knockback magnitude vs PRISTINE vanilla                    */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The real cannon question: does a chain of explosions launch the projectile
+     * the SAME distance as vanilla? This runs the identical multi-TNT shot twice
+     * in the same world — once with the engine PAUSED (so the TNT are never
+     * claimed and tick as pristine vanilla) and once with the engine active —
+     * and compares the projectile's launch distance. The paused control is a
+     * true vanilla baseline (unlike forceVanilla, which neutralises then
+     * restores), so any magnitude divergence is the engine's fault.
+     */
+    private static TestCase chainedKnockbackMatchesVanilla(AsyncTntService service) {
+        return new TestCase("cannon: chained explosion knockback matches vanilla", context -> {
+            if (!service.isEngineActive()) {
+                context.note("engine off — chained-knockback parity does not apply, skipping");
+                return;
+            }
+            double v6 = measureChainedShot(context, service, false, 6);
+            double e6 = measureChainedShot(context, service, true, 6);
+            double v24 = measureChainedShot(context, service, false, 24);
+            double e24 = measureChainedShot(context, service, true, 24);
+            double r6 = e6 / v6;
+            double r24 = e24 / v24;
+            context.note(String.format(Locale.ROOT, "flight=6:  vanilla=%.3f engine=%.3f ratio=%.3f", v6, e6, r6));
+            context.note(String.format(Locale.ROOT, "flight=24: vanilla=%.3f engine=%.3f ratio=%.3f", v24, e24, r24));
+            context.expect(!Double.isNaN(v6) && v6 > 3.0,
+                    "the vanilla control shot did not launch the projectile (got "
+                            + String.format(Locale.ROOT, "%.3f", v6) + ") — fixture is broken");
+            context.expect(!Double.isNaN(e6) && !Double.isNaN(e24), "engine projectile vanished mid-flight");
+            // Tight bound on the early window (low jitter): this is what the one-
+            // tick lag broke — pre-fix r6 was 0.866, so [0.94,1.06] is a real
+            // regression guard. The long window crosses chunk boundaries and
+            // jitters a few %, so it gets a looser bound.
+            context.expect(r6 > 0.94 && r6 < 1.06, String.format(Locale.ROOT,
+                    "engine same-tick knockback diverges from vanilla (one-tick lag?): vanilla=%.3f engine=%.3f (ratio %.3f, want ~1.0)",
+                    v6, e6, r6));
+            context.expect(r24 > 0.90 && r24 < 1.10, String.format(Locale.ROOT,
+                    "engine knockback diverges from vanilla over a long flight: vanilla=%.3f engine=%.3f (ratio %.3f)",
+                    v24, e24, r24));
+        });
+    }
+
+    /**
+     * Fires a 4-TNT same-tick chain at a long-fused projectile and returns how
+     * far west the projectile was launched after a fixed window. {@code engineOn}
+     * selects the engine or pristine vanilla (engine paused). A wide force-load
+     * ring keeps the launched projectile from unloading mid-flight.
+     */
+    private static double measureChainedShot(TestContext context, AsyncTntService service, boolean engineOn,
+            int flight) throws Exception {
+        final int charges = 4;
+        final int fuse = 8;
+        TNTPrimed[] projectile = new TNTPrimed[1];
+        java.util.List<TNTPrimed> chargeList = new java.util.ArrayList<>();
+        double[] startX = new double[1];
+        try {
+            context.syncRun(() -> {
+                World world = Bukkit.getWorlds().get(0);
+                service.setEnginePaused(!engineOn); // paused => pristine vanilla control
+                Location centre = Arena.prepare(world);
+                int bx = centre.getBlockX() >> 4;
+                int bz = centre.getBlockZ() >> 4;
+                for (int dx = -6; dx <= 6; dx++) {
+                    for (int dz = -2; dz <= 2; dz++) {
+                        world.setChunkForceLoaded(bx + dx, bz + dz, true);
+                    }
+                }
+                Location projLoc = Arena.offset(centre, 0.0, 14.0, 0.0); // high, open air
+                projectile[0] = Cannon.primeTnt(projLoc, new Vector(0, 0, 0), 200); // long fuse: survives
+                for (int i = 1; i <= charges; i++) {
+                    // A row of charges to the EAST, same fuse => same-tick chain that launches west.
+                    chargeList.add(Cannon.primeTnt(Arena.offset(centre, i, 14.0, 0.0), new Vector(0, 0, 0), fuse));
+                }
+                startX[0] = projLoc.getX();
+            });
+
+            context.awaitTicks(fuse + flight);
+
+            Double endX = context.sync(() -> projectile[0].isValid() ? projectile[0].getLocation().getX() : null);
+            return endX == null ? Double.NaN : (startX[0] - endX); // westward displacement
+        } finally {
+            context.syncRun(() -> {
+                if (projectile[0] != null && projectile[0].isValid()) {
+                    projectile[0].remove();
+                }
+                for (TNTPrimed c : chargeList) {
+                    if (c != null && c.isValid()) {
+                        c.remove();
+                    }
+                }
+                service.setEnginePaused(false); // restore engine for later cases
+            });
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  Staggered (sequential) directional chain vs PRISTINE vanilla       */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The real directional-cannon scenario: a LINE of TNT with offset fuses —
+     * the far end detonates first, each neighbour a fixed delay later — blasting
+     * a payload along the line. Timing fidelity matters most here: every charge
+     * must detonate on the same server tick the engine-off control does, or the
+     * staged pushes land at the wrong moments and the payload ends up somewhere
+     * else. Runs the identical staggered shot under pristine vanilla (engine
+     * paused) and under the engine and compares where the payload ends up.
+     */
+    private static TestCase staggeredChainMatchesVanilla(AsyncTntService service) {
+        return new TestCase("cannon: staggered directional chain matches vanilla", context -> {
+            if (!service.isEngineActive()) {
+                context.note("engine off — staggered-chain parity does not apply, skipping");
+                return;
+            }
+            // Tight stagger (2t) keeps the payload in range for several stages;
+            // wide stagger (10t = the user's 0.5s) is the classic tuned spacing.
+            for (int stagger : new int[] {2, 10}) {
+                double vanilla = measureStaggeredShot(context, service, false, stagger);
+                double engine = measureStaggeredShot(context, service, true, stagger);
+                double ratio = engine / vanilla;
+                context.note(String.format(Locale.ROOT,
+                        "stagger=%dt: vanilla=%.3f engine=%.3f ratio=%.3f", stagger, vanilla, engine, ratio));
+                // Direction depends on the stagger (wide spacing lets the charges
+                // blast each other back across the payload), so assert on magnitude.
+                context.expect(!Double.isNaN(vanilla) && Math.abs(vanilla) > 2.0, String.format(Locale.ROOT,
+                        "vanilla control did not blast the payload at stagger=%dt (got %.3f) — fixture broken",
+                        stagger, vanilla));
+                context.expect(!Double.isNaN(engine), "engine payload vanished mid-flight at stagger=" + stagger);
+                // Tight bound for the close stagger (the charges stay clustered, so
+                // it's nearly deterministic); looser for the wide stagger, where the
+                // charges scatter and the chain becomes chaotic and jitter-sensitive.
+                double lo = stagger <= 2 ? 0.92 : 0.85;
+                double hi = stagger <= 2 ? 1.08 : 1.15;
+                context.expect(ratio > lo && ratio < hi, String.format(Locale.ROOT,
+                        "engine staggered chain diverges from vanilla at stagger=%dt: vanilla=%.3f engine=%.3f (ratio %.3f, want ~1.0)",
+                        stagger, vanilla, engine, ratio));
+            }
+        });
+    }
+
+    /**
+     * Fires a 5-TNT line with offset fuses (east end first, each {@code stagger}
+     * ticks later) at a long-fused payload at the west end, and returns how far
+     * west the payload travelled by a fixed deadline. {@code engineOn} selects
+     * the engine or pristine vanilla (engine paused).
+     */
+    private static double measureStaggeredShot(TestContext context, AsyncTntService service, boolean engineOn,
+            int stagger) throws Exception {
+        final int charges = 5;
+        final int firstFuse = 8;
+        final int settle = 8;
+        final double altitude = 80.0; // high open air: explosions destroy no blocks, payload lands nothing in-window
+        int lastFuse = firstFuse + (charges - 1) * stagger;
+        TNTPrimed[] payload = new TNTPrimed[1];
+        java.util.List<TNTPrimed> chargeList = new java.util.ArrayList<>();
+        double[] startX = new double[1];
+        try {
+            context.syncRun(() -> {
+                World world = Bukkit.getWorlds().get(0);
+                service.setEnginePaused(!engineOn);
+                Location centre = Arena.prepare(world);
+                int bx = centre.getBlockX() >> 4;
+                int bz = centre.getBlockZ() >> 4;
+                for (int dx = -10; dx <= 10; dx++) {
+                    for (int dz = -2; dz <= 2; dz++) {
+                        world.setChunkForceLoaded(bx + dx, bz + dz, true);
+                    }
+                }
+                // Clean slate: a prior shot's stray TNT/falling blocks would
+                // perturb this one (the scenario is chaotic and amplifies any
+                // residue), so sweep them before staging.
+                world.getEntitiesByClass(TNTPrimed.class).forEach(t -> t.remove());
+                world.getEntitiesByClass(FallingBlock.class).forEach(f -> f.remove());
+                Location payloadLoc = Arena.offset(centre, 0.0, altitude, 0.0);
+                payload[0] = Cannon.primeTnt(payloadLoc, new Vector(0, 0, 0), 400);
+                for (int i = 1; i <= charges; i++) {
+                    // Charge i sits i blocks EAST; the EAST-most (i=charges) fires
+                    // first, each one nearer the payload `stagger` ticks later.
+                    int fuse = firstFuse + (charges - i) * stagger;
+                    chargeList.add(Cannon.primeTnt(Arena.offset(centre, i, altitude, 0.0), new Vector(0, 0, 0), fuse));
+                }
+                startX[0] = payloadLoc.getX();
+            });
+
+            context.awaitTicks(lastFuse + settle);
+
+            Double endX = context.sync(() -> payload[0].isValid() ? payload[0].getLocation().getX() : null);
+            return endX == null ? Double.NaN : (startX[0] - endX);
+        } finally {
+            context.syncRun(() -> {
+                if (payload[0] != null && payload[0].isValid()) {
+                    payload[0].remove();
+                }
+                for (TNTPrimed c : chargeList) {
+                    if (c != null && c.isValid()) {
+                        c.remove();
+                    }
+                }
+                service.setEnginePaused(false);
+            });
+        }
     }
 
     /* ------------------------------------------------------------------ */

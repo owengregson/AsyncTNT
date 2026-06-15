@@ -29,4 +29,15 @@ public interface AsyncTntService {
      * @return true if the entity was owned and has been released
      */
     boolean forceVanilla(@NotNull Entity entity);
+
+    /**
+     * Runtime pause / resume of the engine. When paused, the engine claims no
+     * new TNT/falling blocks and hands everything it owns back to vanilla — a
+     * non-persistent kill-switch. (Also how the parity oracle measures the
+     * engine against pristine vanilla in the same world.)
+     */
+    void setEnginePaused(boolean paused);
+
+    /** Whether the engine is currently paused. */
+    boolean isEnginePaused();
 }

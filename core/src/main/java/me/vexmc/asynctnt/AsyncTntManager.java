@@ -40,4 +40,14 @@ public final class AsyncTntManager implements AsyncTntService {
     public boolean forceVanilla(@NotNull Entity entity) {
         return engine.forceVanilla(entity);
     }
+
+    @Override
+    public void setEnginePaused(boolean paused) {
+        engine.setPaused(paused);
+    }
+
+    @Override
+    public boolean isEnginePaused() {
+        return engine.isPaused();
+    }
 }

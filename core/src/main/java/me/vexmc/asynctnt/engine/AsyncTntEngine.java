@@ -64,6 +64,7 @@ public final class AsyncTntEngine implements EngineHandle {
 
     private volatile ExecutorService workers;
     private volatile boolean active;
+    private volatile boolean paused;
 
     public AsyncTntEngine(JavaPlugin plugin, Scheduling scheduling, NmsAccess nms,
                           Supplier<AsyncTntConfig> config, PhysicsProfile profile) {
@@ -126,9 +127,24 @@ public final class AsyncTntEngine implements EngineHandle {
         return scheduling.describe();
     }
 
+    @Override
+    public void setPaused(boolean p) {
+        this.paused = p;
+        if (p) {
+            for (EngineBody body : new ArrayList<>(bodies.values())) {
+                forceVanilla(body.entity);
+            }
+        }
+    }
+
+    @Override
+    public boolean isPaused() {
+        return paused;
+    }
+
     /** Called on the spawn's owning thread by the spawn interceptor. */
     public void takeOver(Entity entity) {
-        if (!isActive() || !config.get().enabledIn(entity.getWorld().getName())) {
+        if (!isActive() || paused || !config.get().enabledIn(entity.getWorld().getName())) {
             return;
         }
         boolean tnt = nms.isPrimedTnt(entity);
@@ -150,6 +166,22 @@ public final class AsyncTntEngine implements EngineHandle {
         BlockData blockData = (!tnt && entity instanceof FallingBlock fb) ? fb.getBlockData() : null;
         EngineBody body = new EngineBody(entity, state, blockData);
         bodies.put(entity.getUniqueId(), body);
+
+        // Tick-clock alignment: vanilla ticks a freshly-ignited TNT/falling block
+        // on the SAME server tick it appears, but our per-entity driver's first
+        // run is the NEXT tick. Advance one tick of physics now (fuse countdown +
+        // motion) so detonation and movement land on the same tick vanilla's
+        // would — without this every body lags vanilla by exactly one tick, which
+        // is invisible for a lone TNT but makes timing-tuned cannons drift badly.
+        // No teleport or detonation happens here (we ignore the result): we must
+        // not move the entity or explode re-entrantly during its own spawn event;
+        // the driver applies state and acts on any terminal flag next tick.
+        try {
+            integrate(body, entity.getWorld());
+        } catch (Throwable alignFailure) {
+            plugin.getLogger().warning("AsyncTNT spawn-tick alignment failed; body lags one tick: " + alignFailure);
+        }
+
         body.driver = scheduling.repeatOn(entity, 1L, 1L, () -> tick(body), () -> retire(body));
         plugin.getServer().getPluginManager().callEvent(new AsyncTntTakeoverEvent(entity));
     }
@@ -164,26 +196,19 @@ public final class AsyncTntEngine implements EngineHandle {
             return;
         }
         World world = entity.getWorld();
-        if (!config.get().enabledIn(world.getName())) {
-            forceVanilla(entity); // kill-switch / per-world disable
+        if (paused || !config.get().enabledIn(world.getName())) {
+            forceVanilla(entity); // runtime pause / kill-switch / per-world disable
             return;
         }
         try {
-            BodyState s = body.state;
-            Aabb box = s.boundingBox();
-            Aabb bounds = box.expandTowards(s.dx(), s.dy() - 0.04, s.dz());
-            BlockCollisionView blocks = nms.captureCollision(world, bounds);
-            FluidView fluids = s.kind() == BodyState.Kind.TNT ? nms.captureFluid(world, box) : FluidView.EMPTY;
-
-            MotionResult result = MotionIntegrator.tick(s, blocks, fluids, profile, config.get().forkFlags());
-            body.state = result.state();
+            MotionResult result = integrate(body, world);
             nms.applyState(entity, body.state);
 
             if (result.detonate()) {
                 detonate(body);
             } else if (result.landed()) {
                 land(body);
-            } else if (s.kind() == BodyState.Kind.FALLING_BLOCK && shouldDespawn(body.state, world)) {
+            } else if (body.state.kind() == BodyState.Kind.FALLING_BLOCK && shouldDespawn(body.state, world)) {
                 // Vanilla discards falling blocks past their age / out of the world.
                 removeBodyAndEntity(body);
             }
@@ -191,6 +216,24 @@ public final class AsyncTntEngine implements EngineHandle {
             plugin.getLogger().warning("AsyncTNT body errored; returning it to vanilla: " + t);
             forceVanilla(entity);
         }
+    }
+
+    /**
+     * Advance one tick of physics — fuse/age countdown, gravity, collision,
+     * fluids — updating {@link EngineBody#state}. Pure state evolution: it does
+     * not move the entity or fire detonation/landing; the returned result says
+     * whether the caller should. Shared by the per-tick driver and the
+     * spawn-tick alignment in {@link #takeOver}.
+     */
+    private MotionResult integrate(EngineBody body, World world) {
+        BodyState s = body.state;
+        Aabb box = s.boundingBox();
+        Aabb bounds = box.expandTowards(s.dx(), s.dy() - 0.04, s.dz());
+        BlockCollisionView blocks = nms.captureCollision(world, bounds);
+        FluidView fluids = s.kind() == BodyState.Kind.TNT ? nms.captureFluid(world, box) : FluidView.EMPTY;
+        MotionResult result = MotionIntegrator.tick(s, blocks, fluids, profile, config.get().forkFlags());
+        body.state = result.state();
+        return result;
     }
 
     private static boolean shouldDespawn(BodyState s, World world) {
