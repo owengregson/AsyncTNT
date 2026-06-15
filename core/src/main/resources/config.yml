@@ -1,0 +1,75 @@
+# ──────────────────────────────────────────────────────────────────────────
+#  AsyncTNT
+#
+#  Folia-native asynchronous TNT and falling-block ticking with 1:1 vanilla
+#  physics. Out of the box, AsyncTNT moves the simulation off the main thread
+#  but reproduces vanilla behaviour byte-for-byte — the same blast pattern, the
+#  same fuse timing, the same entity scatter. Nothing below changes the game
+#  until you opt in.
+#
+#  This file is the documentation. Every key is explained inline. A malformed
+#  value never crashes the plugin: it is logged once ("config — <key>: ...")
+#  and the documented default is used instead. Edit, then run `/asynctnt reload`
+#  (or `/atnt reload`) to apply changes atomically — the engine swaps to the new
+#  configuration between ticks, never mid-tick.
+# ──────────────────────────────────────────────────────────────────────────
+
+engine:
+  # Master switch for the off-thread engine.
+  #   true  — the engine owns primed TNT and falling blocks and ticks them on
+  #           its worker pool (the whole point of the plugin).
+  #   false — the kill switch. Every body the engine owns is released back to
+  #           vanilla main-thread ticking and no new ones are claimed. Identical
+  #           to running a server without AsyncTNT installed. Reachable live via
+  #           `/asynctnt killswitch`.
+  enabled: true
+
+  # Worlds the engine must NEVER touch, by name (case-sensitive, as the server
+  # reports them). TNT and falling blocks in these worlds tick on the main
+  # thread exactly as vanilla does. Useful for a creative or build world where
+  # off-thread ticking is not wanted. Empty means "every world".
+  # Example:
+  #   disabled-worlds:
+  #     - world_creative
+  #     - build
+  # Reachable live via `/asynctnt world <name> <on|off>`.
+  disabled-worlds: []
+
+  # Size of the compute pool that ticks owned bodies. Must be at least 1; a
+  # smaller value is clamped up and logged. The shipped default leaves two cores
+  # for the main server thread and the OS (cores - 2, floored at 1), which is a
+  # good balance for most boxes. Raise it on a machine with cores to spare and
+  # very large cannons; there is rarely a reason to lower it below the default.
+  worker-threads: 2
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Fork fixes — opt-in cannon stabilization (TacoSpigot / PandaSpigot lineage)
+#
+#  These four toggles reproduce well-known TacoSpigot/PandaSpigot patches that
+#  competitive cannoning servers rely on to make cannons fire consistently.
+#  They are NOT vanilla. Every one defaults to false, and with all four false
+#  AsyncTNT's output is byte-identical to vanilla Minecraft physics. Enable only
+#  the ones your cannon designs were tuned against — enabling a fix changes the
+#  blast/entity behaviour for the entire server.
+# ──────────────────────────────────────────────────────────────────────────
+fork-fixes:
+  # Zero the random ±0.02 horizontal spawn scatter applied to primed TNT, so a
+  # stack of TNT spawns at a deterministic position (TacoSpigot). Default false
+  # keeps vanilla's random scatter — byte-identical vanilla.
+  zero-spawn-kick: false
+
+  # Force every primed TNT's fuse to exactly 80 ticks, removing vanilla's small
+  # fuse randomisation (TacoSpigot/PandaSpigot). Default false keeps vanilla's
+  # randomised fuse — byte-identical vanilla.
+  fixed-fuse-80: false
+
+  # Use a fixed redstone firing-direction order (W, E, N, S, Down, Up) so a
+  # redstone-ignited cannon fires the same way every shot (PandaSpigot). Default
+  # false keeps vanilla's order — byte-identical vanilla.
+  deterministic-redstone: false
+
+  # Force a stable X/Z collision-resolution order, removing vanilla's
+  # |dx| < |dz| east/west asymmetry that makes mirrored cannons fire unevenly
+  # (TacoSpigot). Default false keeps vanilla's asymmetric resolution —
+  # byte-identical vanilla.
+  east-west-collision-fix: false

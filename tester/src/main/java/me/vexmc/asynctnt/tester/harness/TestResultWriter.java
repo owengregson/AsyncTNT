@@ -9,11 +9,11 @@ import org.bukkit.plugin.java.JavaPlugin;
 import org.jetbrains.annotations.NotNull;
 
 /** Writes PASS/FAIL for the Gradle check task, then the failure details. */
-final class TestResultWriter {
+public final class TestResultWriter {
 
     private TestResultWriter() {}
 
-    static void write(@NotNull JavaPlugin plugin, boolean success, @NotNull List<String> failures) {
+    public static void write(@NotNull JavaPlugin plugin, boolean success, @NotNull List<String> failures) {
         File dataFolder = plugin.getDataFolder();
         if (!dataFolder.exists() && !dataFolder.mkdirs()) {
             plugin.getLogger().severe("Could not create data folder for test results");
