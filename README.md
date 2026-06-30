@@ -1,5 +1,7 @@
 # AsyncTNT
 
+** WARNING STILL VERY BUGGY, IN ACTIVE DEVELOPMENT **
+
 **Asynchronous TNT for Paper & Folia — kill the lag from TNT cannons without changing how TNT works.**
 
 AsyncTNT moves the heavy work of ticking primed TNT and falling blocks (sand/gravel) and computing
